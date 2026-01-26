@@ -1,0 +1,29 @@
+version: v1alpha1
+metadata:
+  name: advanced-demo
+spec:
+  region: us-central1
+  kubernetesVersion: v1.35.0
+
+  # Example: Enable specific alpha/beta features
+  featureGates:
+    "UnknownVersionInteroperabilityProxy": true
+
+  # Example: Enable specific API versions
+  runtimeConfig:
+    "flowcontrol.apiserver.k8s.io/v1beta3": "true"
+
+  networks:
+  - name: advanced-net
+    subnets: [{name: advanced-sub, cidr: 10.20.0.0/24}]
+
+  controlPlane:
+    name: cp
+    zone: us-central1-a
+    machineType: n1-standard-2
+
+  workerGroups:
+  - name: workers
+    replicas: 1
+    zone: us-central1-a
+    machineType: n1-standard-2
