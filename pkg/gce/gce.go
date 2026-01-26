@@ -1,6 +1,7 @@
 package gce
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -16,8 +17,8 @@ func NewClient() *Client {
 	return &Client{}
 }
 
-func (c *Client) Run(args ...string) (string, error) {
-	cmd := exec.Command("gcloud", args...)
+func (c *Client) Run(ctx context.Context, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "gcloud", args...)
 	cmd.Env = os.Environ()
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -34,9 +35,9 @@ func IsAlreadyExistsError(err error) bool {
 }
 
 // RunJSON executes a gcloud command and unmarshals the output into the provided struct
-func (c *Client) RunJSON(v interface{}, args ...string) error {
+func (c *Client) RunJSON(ctx context.Context, v interface{}, args ...string) error {
 	args = append(args, "--format=json")
-	out, err := c.Run(args...)
+	out, err := c.Run(ctx, args...)
 	if err != nil {
 		return err
 	}
@@ -51,8 +52,8 @@ func (c *Client) CheckGcloud() error {
 	return nil
 }
 
-func (c *Client) GetCurrentProject() (string, error) {
-	out, err := c.Run("config", "get-value", "project")
+func (c *Client) GetCurrentProject(ctx context.Context) (string, error) {
+	out, err := c.Run(ctx, "config", "get-value", "project")
 	if err != nil {
 		return "", err
 	}
@@ -64,8 +65,8 @@ func (c *Client) GetCurrentProject() (string, error) {
 }
 
 // GetDefaultZone attempts to read compute/zone from gcloud config
-func (c *Client) GetDefaultZone() string {
-	out, err := c.Run("config", "get-value", "compute/zone")
+func (c *Client) GetDefaultZone(ctx context.Context) string {
+	out, err := c.Run(ctx, "config", "get-value", "compute/zone")
 	if err != nil {
 		return ""
 	}
@@ -73,25 +74,25 @@ func (c *Client) GetDefaultZone() string {
 }
 
 // GetDefaultRegion attempts to read compute/region from gcloud config
-func (c *Client) GetDefaultRegion() string {
-	out, err := c.Run("config", "get-value", "compute/region")
+func (c *Client) GetDefaultRegion(ctx context.Context) string {
+	out, err := c.Run(ctx, "config", "get-value", "compute/region")
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(out)
 }
 
-func (c *Client) VerifyComputeAPI() error {
+func (c *Client) VerifyComputeAPI(ctx context.Context) error {
 	var dump interface{}
-	return c.RunJSON(&dump, "compute", "project-info", "describe")
+	return c.RunJSON(ctx, &dump, "compute", "project-info", "describe")
 }
 
-func (c *Client) NetworkExists(name string) bool {
-	_, err := c.Run("compute", "networks", "describe", name)
+func (c *Client) NetworkExists(ctx context.Context, name string) bool {
+	_, err := c.Run(ctx, "compute", "networks", "describe", name)
 	return err == nil
 }
 
-func (c *Client) CreateNetwork(name string, autoMode bool, mtu int, profile string) error {
+func (c *Client) CreateNetwork(ctx context.Context, name string, autoMode bool, mtu int, profile string) error {
 	mode := "custom"
 	if autoMode {
 		mode = "auto"
@@ -106,52 +107,52 @@ func (c *Client) CreateNetwork(name string, autoMode bool, mtu int, profile stri
 		args = append(args, "--network-profile", profile)
 	}
 
-	_, err := c.Run(args...)
+	_, err := c.Run(ctx, args...)
 	return err
 }
 
-func (c *Client) CreateSubnet(name, network, region, rangeCIDR string) error {
-	_, err := c.Run("compute", "networks", "subnets", "create", name,
+func (c *Client) CreateSubnet(ctx context.Context, name, network, region, rangeCIDR string) error {
+	_, err := c.Run(ctx, "compute", "networks", "subnets", "create", name,
 		"--network", network,
 		"--region", region,
 		"--range", rangeCIDR)
 	return err
 }
 
-func (c *Client) CreateFirewallRules(clusterName, network string) error {
-	if _, err := c.Run("compute", "firewall-rules", "create", clusterName+"-internal",
+func (c *Client) CreateFirewallRules(ctx context.Context, clusterName, network string) error {
+	if _, err := c.Run(ctx, "compute", "firewall-rules", "create", clusterName+"-internal",
 		"--network", network, "--allow", "tcp,udp,icmp", "--source-ranges", "10.0.0.0/8,192.168.0.0/16,172.16.0.0/12"); err != nil && !IsAlreadyExistsError(err) {
 		return err
 	}
 
-	if _, err := c.Run("compute", "firewall-rules", "create", clusterName+"-external",
+	if _, err := c.Run(ctx, "compute", "firewall-rules", "create", clusterName+"-external",
 		"--network", network, "--allow", "tcp:22,tcp:6443", "--source-ranges", "0.0.0.0/0"); err != nil && !IsAlreadyExistsError(err) {
 		return err
 	}
 	return nil
 }
 
-func (c *Client) EnsureStaticIP(name, region string) (string, error) {
+func (c *Client) EnsureStaticIP(ctx context.Context, name, region string) (string, error) {
 	// Define struct for decoding just what we need
 	type Address struct {
 		Address string `json:"address"`
 	}
 	var addr Address
 
-	err := c.RunJSON(&addr, "compute", "addresses", "describe", name, "--region", region)
+	err := c.RunJSON(ctx, &addr, "compute", "addresses", "describe", name, "--region", region)
 	if err == nil && addr.Address != "" {
 		return addr.Address, nil
 	}
 
-	if _, err := c.Run("compute", "addresses", "create", name, "--region", region); err != nil && !IsAlreadyExistsError(err) {
+	if _, err := c.Run(ctx, "compute", "addresses", "create", name, "--region", region); err != nil && !IsAlreadyExistsError(err) {
 		return "", err
 	}
 
-	err = c.RunJSON(&addr, "compute", "addresses", "describe", name, "--region", region)
+	err = c.RunJSON(ctx, &addr, "compute", "addresses", "describe", name, "--region", region)
 	return addr.Address, err
 }
 
-func (c *Client) CreateInstance(name, zone, machineType, network, subnet, image, serviceAccount, startupScript, address string, tags []string) error {
+func (c *Client) CreateInstance(ctx context.Context, name, zone, machineType, network, subnet, image, serviceAccount, startupScript, address string, tags []string) error {
 	args := []string{
 		"compute", "instances", "create", name,
 		"--zone", zone,
@@ -171,7 +172,7 @@ func (c *Client) CreateInstance(name, zone, machineType, network, subnet, image,
 	if serviceAccount != "" {
 		args = append(args, "--service-account", serviceAccount)
 	}
-	_, err := c.Run(args...)
+	_, err := c.Run(ctx, args...)
 	return err
 }
 
@@ -181,9 +182,9 @@ type Address struct {
 	Address string `json:"address"`
 }
 
-func (c *Client) ListAddresses(filter string) ([]Address, error) {
+func (c *Client) ListAddresses(ctx context.Context, filter string) ([]Address, error) {
 	var addresses []Address
-	err := c.RunJSON(&addresses, "compute", "addresses", "list", "--filter", filter)
+	err := c.RunJSON(ctx, &addresses, "compute", "addresses", "list", "--filter", filter)
 	if err != nil {
 		return nil, err
 	}
@@ -197,34 +198,34 @@ func (c *Client) ListAddresses(filter string) ([]Address, error) {
 	return addresses, nil
 }
 
-func (c *Client) DeleteAddress(name, region string) error {
+func (c *Client) DeleteAddress(ctx context.Context, name, region string) error {
 	args := []string{"compute", "addresses", "delete", name, "--quiet"}
 	if region != "" && region != "global" {
 		args = append(args, "--region", region)
 	} else {
 		args = append(args, "--global")
 	}
-	_, err := c.Run(args...)
+	_, err := c.Run(ctx, args...)
 	return err
 }
 
-func (c *Client) SSH(instance, zone, command string) error {
-	cmd := exec.Command("gcloud", "compute", "ssh", instance, "--zone", zone, "--command", command, "--", "-t", "-q")
+func (c *Client) SSH(ctx context.Context, instance, zone, command string) error {
+	cmd := exec.CommandContext(ctx, "gcloud", "compute", "ssh", instance, "--zone", zone, "--command", command, "--", "-t", "-q")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
-func (c *Client) RunSSHOutput(instance, zone, command string) (string, error) {
-	return c.Run("compute", "ssh", instance, "--zone", zone, "--command", command, "--", "-q")
+func (c *Client) RunSSHOutput(ctx context.Context, instance, zone, command string) (string, error) {
+	return c.Run(ctx, "compute", "ssh", instance, "--zone", zone, "--command", command, "--", "-q")
 }
 
-func (c *Client) SCP(localPath, remotePath, zone string) error {
-	cmd := exec.Command("gcloud", "compute", "scp", localPath, remotePath, "--zone", zone)
+func (c *Client) SCP(ctx context.Context, localPath, remotePath, zone string) error {
+	cmd := exec.CommandContext(ctx, "gcloud", "compute", "scp", localPath, remotePath, "--zone", zone)
 	return cmd.Run()
 }
 
-func (c *Client) CreateInstanceTemplate(name, machineType string, networks, subnets []string, image, startupScript string, tags []string) error {
+func (c *Client) CreateInstanceTemplate(ctx context.Context, name, machineType string, networks, subnets []string, image, startupScript string, tags []string) error {
 	args := []string{
 		"compute", "instance-templates", "create", name,
 		"--machine-type", machineType,
@@ -244,12 +245,12 @@ func (c *Client) CreateInstanceTemplate(name, machineType string, networks, subn
 			args = append(args, "--network-interface", nicArg+",no-address")
 		}
 	}
-	_, err := c.Run(args...)
+	_, err := c.Run(ctx, args...)
 	return err
 }
 
-func (c *Client) CreateMIG(name, template, zone string, size int) error {
-	_, err := c.Run("compute", "instance-groups", "managed", "create", name,
+func (c *Client) CreateMIG(ctx context.Context, name, template, zone string, size int) error {
+	_, err := c.Run(ctx, "compute", "instance-groups", "managed", "create", name,
 		"--base-instance-name", name,
 		"--template", template,
 		"--size", fmt.Sprintf("%d", size),
@@ -262,11 +263,11 @@ type Group struct {
 	Zone string `json:"zone"`
 }
 
-func (c *Client) ListInstanceGroups(filter string) ([]Group, error) {
+func (c *Client) ListInstanceGroups(ctx context.Context, filter string) ([]Group, error) {
 	var groups []Group
 	// List both managed and unmanaged? Or just managed?
 	// `gcloud compute instance-groups list` lists both.
-	err := c.RunJSON(&groups, "compute", "instance-groups", "list", "--filter", filter)
+	err := c.RunJSON(ctx, &groups, "compute", "instance-groups", "list", "--filter", filter)
 	if err != nil {
 		return nil, err
 	}
@@ -278,60 +279,60 @@ func (c *Client) ListInstanceGroups(filter string) ([]Group, error) {
 	return groups, nil
 }
 
-func (c *Client) DeleteMIG(name, zone string) error {
-	_, err := c.Run("compute", "instance-groups", "managed", "delete", name, "--zone", zone, "--quiet")
+func (c *Client) DeleteMIG(ctx context.Context, name, zone string) error {
+	_, err := c.Run(ctx, "compute", "instance-groups", "managed", "delete", name, "--zone", zone, "--quiet")
 	return err
 }
 
-func (c *Client) CreateUnmanagedInstanceGroup(name, zone string) error {
+func (c *Client) CreateUnmanagedInstanceGroup(ctx context.Context, name, zone string) error {
 	// check if exists first? gcloud usually errors if exists
-	_, err := c.Run("compute", "instance-groups", "unmanaged", "create", name, "--zone", zone)
+	_, err := c.Run(ctx, "compute", "instance-groups", "unmanaged", "create", name, "--zone", zone)
 	return err
 }
 
-func (c *Client) AddInstancesToGroup(group, zone string, instances ...string) error {
+func (c *Client) AddInstancesToGroup(ctx context.Context, group, zone string, instances ...string) error {
 	args := []string{"compute", "instance-groups", "unmanaged", "add-instances", group, "--zone", zone, "--instances", strings.Join(instances, ",")}
-	_, err := c.Run(args...)
+	_, err := c.Run(ctx, args...)
 	return err
 }
 
-func (c *Client) CreateRegionHealthCheck(name, region string) error {
-	_, err := c.Run("compute", "health-checks", "create", "tcp", name, "--region", region, "--port", "6443")
+func (c *Client) CreateRegionHealthCheck(ctx context.Context, name, region string) error {
+	_, err := c.Run(ctx, "compute", "health-checks", "create", "tcp", name, "--region", region, "--port", "6443")
 	return err
 }
 
-func (c *Client) CreateRegionBackendService(name, region, healthCheck string) error {
-	_, err := c.Run("compute", "backend-services", "create", name, "--protocol", "TCP", "--health-checks", healthCheck, "--health-checks-region", region, "--region", region, "--load-balancing-scheme", "EXTERNAL")
+func (c *Client) CreateRegionBackendService(ctx context.Context, name, region, healthCheck string) error {
+	_, err := c.Run(ctx, "compute", "backend-services", "create", name, "--protocol", "TCP", "--health-checks", healthCheck, "--health-checks-region", region, "--region", region, "--load-balancing-scheme", "EXTERNAL")
 	return err
 }
 
-func (c *Client) AddRegionBackend(service, region, group, groupZone string) error {
-	_, err := c.Run("compute", "backend-services", "add-backend", service, "--region", region, "--instance-group", group, "--instance-group-zone", groupZone)
+func (c *Client) AddRegionBackend(ctx context.Context, service, region, group, groupZone string) error {
+	_, err := c.Run(ctx, "compute", "backend-services", "add-backend", service, "--region", region, "--instance-group", group, "--instance-group-zone", groupZone)
 	return err
 }
 
-func (c *Client) CreateRegionForwardingRule(name, region, service, address string) error {
-	_, err := c.Run("compute", "forwarding-rules", "create", name, "--region", region, "--backend-service", service, "--address", address, "--ports", "6443")
+func (c *Client) CreateRegionForwardingRule(ctx context.Context, name, region, service, address string) error {
+	_, err := c.Run(ctx, "compute", "forwarding-rules", "create", name, "--region", region, "--backend-service", service, "--address", address, "--ports", "6443")
 	return err
 }
 
-func (c *Client) DeleteRegionForwardingRule(name, region string) error {
-	_, err := c.Run("compute", "forwarding-rules", "delete", name, "--region", region, "--quiet")
+func (c *Client) DeleteRegionForwardingRule(ctx context.Context, name, region string) error {
+	_, err := c.Run(ctx, "compute", "forwarding-rules", "delete", name, "--region", region, "--quiet")
 	return err
 }
 
-func (c *Client) DeleteRegionBackendService(name, region string) error {
-	_, err := c.Run("compute", "backend-services", "delete", name, "--region", region, "--quiet")
+func (c *Client) DeleteRegionBackendService(ctx context.Context, name, region string) error {
+	_, err := c.Run(ctx, "compute", "backend-services", "delete", name, "--region", region, "--quiet")
 	return err
 }
 
-func (c *Client) DeleteRegionHealthCheck(name, region string) error {
-	_, err := c.Run("compute", "health-checks", "delete", name, "--region", region, "--quiet")
+func (c *Client) DeleteRegionHealthCheck(ctx context.Context, name, region string) error {
+	_, err := c.Run(ctx, "compute", "health-checks", "delete", name, "--region", region, "--quiet")
 	return err
 }
 
-func (c *Client) DeleteUnmanagedInstanceGroup(name, zone string) error {
-	_, err := c.Run("compute", "instance-groups", "unmanaged", "delete", name, "--zone", zone, "--quiet")
+func (c *Client) DeleteUnmanagedInstanceGroup(ctx context.Context, name, zone string) error {
+	_, err := c.Run(ctx, "compute", "instance-groups", "unmanaged", "delete", name, "--zone", zone, "--quiet")
 	return err
 }
 
@@ -340,7 +341,7 @@ type Instance struct {
 	Zone string `json:"zone"`
 }
 
-func (c *Client) ListInstances(tags []string) ([]Instance, error) {
+func (c *Client) ListInstances(ctx context.Context, tags []string) ([]Instance, error) {
 	var filter []string
 	for _, t := range tags {
 		filter = append(filter, fmt.Sprintf("tags.items=%s", t))
@@ -351,7 +352,7 @@ func (c *Client) ListInstances(tags []string) ([]Instance, error) {
 	// We need to parse zone from the full URL e.g. "projects/p/zones/z/instances/name" or just "zones/z"
 	// gcloud json output for List usually gives full selfLink or localized zone name.
 	// Let's check "zone" field in output.
-	err := c.RunJSON(&instances, "compute", "instances", "list", "--filter", filterStr)
+	err := c.RunJSON(ctx, &instances, "compute", "instances", "list", "--filter", filterStr)
 	if err != nil {
 		return nil, err
 	}
