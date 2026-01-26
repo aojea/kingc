@@ -24,6 +24,13 @@ func (c *Client) Run(args ...string) (string, error) {
 	return string(out), nil
 }
 
+func IsAlreadyExistsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "already exists")
+}
+
 // RunJSON executes a gcloud command and unmarshals the output into the provided struct
 func (c *Client) RunJSON(v interface{}, args ...string) error {
 	args = append(args, "--format=json")
@@ -110,11 +117,15 @@ func (c *Client) CreateSubnet(name, network, region, rangeCIDR string) error {
 }
 
 func (c *Client) CreateFirewallRules(clusterName, network string) error {
-	c.Run("compute", "firewall-rules", "create", clusterName+"-internal",
-		"--network", network, "--allow", "tcp,udp,icmp", "--source-ranges", "10.0.0.0/8,192.168.0.0/16,172.16.0.0/12")
+	if _, err := c.Run("compute", "firewall-rules", "create", clusterName+"-internal",
+		"--network", network, "--allow", "tcp,udp,icmp", "--source-ranges", "10.0.0.0/8,192.168.0.0/16,172.16.0.0/12"); err != nil && !IsAlreadyExistsError(err) {
+		return err
+	}
 
-	c.Run("compute", "firewall-rules", "create", clusterName+"-external",
-		"--network", network, "--allow", "tcp:22,tcp:6443", "--source-ranges", "0.0.0.0/0")
+	if _, err := c.Run("compute", "firewall-rules", "create", clusterName+"-external",
+		"--network", network, "--allow", "tcp:22,tcp:6443", "--source-ranges", "0.0.0.0/0"); err != nil && !IsAlreadyExistsError(err) {
+		return err
+	}
 	return nil
 }
 
@@ -130,7 +141,9 @@ func (c *Client) EnsureStaticIP(name, region string) (string, error) {
 		return addr.Address, nil
 	}
 
-	c.Run("compute", "addresses", "create", name, "--region", region)
+	if _, err := c.Run("compute", "addresses", "create", name, "--region", region); err != nil && !IsAlreadyExistsError(err) {
+		return "", err
+	}
 
 	err = c.RunJSON(&addr, "compute", "addresses", "describe", name, "--region", region)
 	return addr.Address, err
@@ -147,7 +160,9 @@ func (c *Client) EnsureGlobalAddress(name string) (string, error) {
 		return addr.Address, nil
 	}
 
-	c.Run("compute", "addresses", "create", name, "--global")
+	if _, err := c.Run("compute", "addresses", "create", name, "--global"); err != nil && !IsAlreadyExistsError(err) {
+		return "", err
+	}
 
 	err = c.RunJSON(&addr, "compute", "addresses", "describe", name, "--global")
 	return addr.Address, err
@@ -256,12 +271,12 @@ func (c *Client) CreateInstanceTemplate(name, machineType string, networks, subn
 }
 
 func (c *Client) CreateMIG(name, template, zone string, size int) error {
-	c.Run("compute", "instance-groups", "managed", "create", name,
+	_, err := c.Run("compute", "instance-groups", "managed", "create", name,
 		"--base-instance-name", name,
 		"--template", template,
 		"--size", fmt.Sprintf("%d", size),
 		"--zone", zone)
-	return nil
+	return err
 }
 
 func (c *Client) CreateUnmanagedInstanceGroup(name, zone string) error {

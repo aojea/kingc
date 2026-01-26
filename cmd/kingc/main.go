@@ -43,7 +43,7 @@ func init() {
 
 func main() {
 	klog.InitFlags(nil)
-	flag.CommandLine.Set("logtostderr", "true")
+	_ = flag.CommandLine.Set("logtostderr", "true")
 
 	if err := rootCmd.Execute(); err != nil {
 		klog.Error(err)
