@@ -30,4 +30,6 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
-kingc
+
+# Built binary in root directory
+/kingc
