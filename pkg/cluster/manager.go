@@ -158,29 +158,8 @@ echo "👑 kingc: Control Plane Initialized"
 		return fmt.Errorf("no networks defined in spec")
 	}
 
-	resolveSubnet := func(netName, explicitSubnet string) (string, error) {
-		if explicitSubnet != "" {
-			return explicitSubnet, nil
-		}
-		for _, n := range cfg.Spec.Networks {
-			if n.Name == netName {
-				if len(n.Subnets) == 0 {
-					if netName == "default" {
-						return "default", nil
-					}
-					return netName, nil
-				}
-				if len(n.Subnets) == 1 {
-					return n.Subnets[0].Name, nil
-				}
-				return "", fmt.Errorf("network '%s' has multiple subnets; explicit subnet required", netName)
-			}
-		}
-		return "", fmt.Errorf("network '%s' not found in config", netName)
-	}
-
 	cpNet := cfg.Spec.Networks[0].Name
-	cpSub, err := resolveSubnet(cpNet, "")
+	cpSub, err := resolveSubnet(cfg.Spec.Networks, cpNet, "")
 	if err != nil {
 		return fmt.Errorf("resolving CP network: %v", err)
 	}
@@ -204,7 +183,7 @@ echo "👑 kingc: Control Plane Initialized"
 	err = m.gce.CreateInstance(
 		cpName, cpZone, cfg.Spec.ControlPlane.MachineType,
 		cpNet, cpSub,
-		"ubuntu-2204-lts", "", tmpCPStartup.Name(),
+		config.DefaultImageFamily, "", tmpCPStartup.Name(),
 		"", // No static IP attached directly (Ephemeral public IP is default if not specified? Or none?)
 		// CreateInstance implementation: if address is "", it doesn't pass --address.
 		// gcloud default is Ephemeral External IP unless --no-address is passed.
@@ -265,7 +244,10 @@ echo "👑 kingc: Control Plane Initialized"
 	// 7. Worker Pools
 	klog.Infof("  > Provisioning Worker Groups...")
 	tokenCmd := "sudo kubeadm token create --print-join-command"
-	joinCommand, _ := m.gce.RunSSHOutput(cpName, cpZone, tokenCmd)
+	joinCommand, err := m.gce.RunSSHOutput(cpName, cpZone, tokenCmd)
+	if err != nil {
+		return fmt.Errorf("failed to get join command: %v", err)
+	}
 	joinCommand = strings.TrimSpace(joinCommand)
 
 	workerStartup := fmt.Sprintf(`%s
@@ -277,7 +259,10 @@ echo "👑 kingc: Joining cluster..."
 %s --ignore-preflight-errors=NumCPU
 `, baseInstallScript, joinCommand)
 
-	tmpWorkerStartup, _ := os.CreateTemp("", "worker-startup-*.sh")
+	tmpWorkerStartup, err := os.CreateTemp("", "worker-startup-*.sh")
+	if err != nil {
+		return fmt.Errorf("failed to create worker startup script: %v", err)
+	}
 	if err := os.WriteFile(tmpWorkerStartup.Name(), []byte(workerStartup), 0644); err != nil {
 		return fmt.Errorf("failed to write worker startup script: %v", err)
 	}
@@ -291,7 +276,7 @@ echo "👑 kingc: Joining cluster..."
 		if len(grp.Interfaces) > 0 {
 			for _, iface := range grp.Interfaces {
 				netName := iface.Network
-				subName, err := resolveSubnet(netName, iface.Subnet)
+				subName, err := resolveSubnet(cfg.Spec.Networks, netName, iface.Subnet)
 				if err != nil {
 					return err
 				}
@@ -307,7 +292,7 @@ echo "👑 kingc: Joining cluster..."
 		tmplName := fmt.Sprintf("%s-%s-tmpl", cfg.Metadata.Name, grp.Name)
 		if err := m.gce.CreateInstanceTemplate(
 			tmplName, grp.MachineType, networks, subnets,
-			"ubuntu-2204-lts", tmpWorkerStartup.Name(),
+			config., tmpWorkerStartup.Name(),
 			[]string{
 				"kingc-cluster-" + cfg.Metadata.Name,
 				"kingc-role-worker",
@@ -481,4 +466,25 @@ func (m *Manager) waitForAPIServer(ip string, timeout time.Duration) error {
 		fmt.Print(".")
 		time.Sleep(5 * time.Second)
 	}
+}
+
+func resolveSubnet(networks []config.Network, netName, explicitSubnet string) (string, error) {
+	if explicitSubnet != "" {
+		return explicitSubnet, nil
+	}
+	for _, n := range networks {
+		if n.Name == netName {
+			if len(n.Subnets) == 0 {
+				if netName == "default" {
+					return "default", nil
+				}
+				return netName, nil
+			}
+			if len(n.Subnets) == 1 {
+				return n.Subnets[0].Name, nil
+			}
+			return "", fmt.Errorf("network '%s' has multiple subnets; explicit subnet required", netName)
+		}
+	}
+	return "", fmt.Errorf("network '%s' not found in config", netName)
 }
