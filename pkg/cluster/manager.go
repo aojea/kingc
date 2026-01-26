@@ -177,7 +177,7 @@ echo "👑 kingc: Control Plane Initialized"
 		config.DefaultImageFamily, "", tmpCPStartup.Name(),
 		"",
 		[]string{
-			"kingc-cluster-" + cfg.Metadata.Name,
+			basename(cfg.Metadata.Name),
 			"kingc-role-control-plane",
 		},
 	)
@@ -187,7 +187,7 @@ echo "👑 kingc: Control Plane Initialized"
 
 	// 5b. Configure Regional Load Balancer Logic
 	klog.Infof("  > Configuring Regional Load Balancer...")
-	baseName := "kingc-cluster-" + cfg.Metadata.Name
+	baseName := basename(cfg.Metadata.Name)
 	region := cfg.Spec.ControlPlane.Region
 	hcName := baseName + "-hc"
 	bsName := baseName + "-bs"
@@ -318,7 +318,7 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 	var errs []error
 
 	// 1. Delete Regional LB Resources (Dependencies for Instance Groups)
-	baseName := name
+	baseName := basename(name)
 	addressName := baseName + "-api"
 
 	// Gather regions from all possible regional resources
@@ -360,8 +360,8 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 		}
 	}
 
-	// D. Check Instances
-	tags := []string{"kingc-cluster-" + name}
+	// We also verify instances to find regions if address is missing
+	tags := []string{basename(name)}
 	instances, err := m.gce.ListInstances(ctx, tags)
 	if err != nil {
 		klog.Warningf("    ⚠️  Failed to list instances: %v", err)
@@ -534,4 +534,8 @@ func resolveSubnet(networks []config.NetworkSpec, netName, explicitSubnet string
 		}
 	}
 	return "", fmt.Errorf("network '%s' not found in config", netName)
+}
+
+func basename(name string) string {
+	return "kingc-cluster-" + name
 }
