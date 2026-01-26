@@ -453,7 +453,7 @@ func (m *Manager) waitForAPIServer(ip string, timeout time.Duration) error {
 	}
 }
 
-func resolveSubnet(networks []config.Network, netName, explicitSubnet string) (string, error) {
+func resolveSubnet(networks []config.NetworkSpec, netName, explicitSubnet string) (string, error) {
 	if explicitSubnet != "" {
 		return explicitSubnet, nil
 	}

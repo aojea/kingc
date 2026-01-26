@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"testing"
 )
 
@@ -189,5 +190,50 @@ func TestValidate(t *testing.T) {
 				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestLoadFromFile(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "kingc-config-*.yaml")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	content := `
+version: v1alpha1
+metadata:
+  name: should-be-ignored
+spec:
+  region: us-west2
+  controlPlane:
+    name: my-cp
+`
+	if _, err := tmpFile.Write([]byte(content)); err != nil {
+		t.Fatalf("Failed to write temp file: %v", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		t.Fatalf("Failed to close temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("Load() unexpected error: %v", err)
+	}
+
+	// Metadata should be ignored (yaml:"-") and stay as default
+	if cfg.Metadata.Name == "should-be-ignored" {
+		t.Errorf("Expected metadata.name to be ignored, got 'should-be-ignored'")
+	}
+	if cfg.Metadata.Name != DefaultClusterName {
+		t.Errorf("Expected metadata.name to be default '%s', got '%s'", DefaultClusterName, cfg.Metadata.Name)
+	}
+
+	// Spec should be loaded
+	if cfg.Spec.Region != "us-west2" {
+		t.Errorf("Expected spec.region 'us-west2', got '%s'", cfg.Spec.Region)
+	}
+	if cfg.Spec.ControlPlane.Name != "my-cp" {
+		t.Errorf("Expected cp.name 'my-cp', got '%s'", cfg.Spec.ControlPlane.Name)
 	}
 }
