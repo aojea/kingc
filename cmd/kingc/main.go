@@ -46,7 +46,9 @@ func runCreate(cmd *cobra.Command, args []string) {
 		cfg.Metadata.Name = name
 	}
 
-	if err := cluster.NewManager().Create(cfg); err != nil {
+	retain, _ := cmd.Flags().GetBool("retain")
+
+	if err := cluster.NewManager().Create(cfg, retain); err != nil {
 		klog.Fatalf("❌ Error creating cluster: %v", err)
 	}
 }

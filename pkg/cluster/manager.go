@@ -41,11 +41,23 @@ func (m *Manager) Preflight() error {
 	return nil
 }
 
-func (m *Manager) Create(cfg *config.Cluster) error {
-	if err := m.Preflight(); err != nil {
+func (m *Manager) Create(cfg *config.Cluster, retain bool) (err error) {
+	klog.Infof("🚀 Creating cluster '%s' (v%s) in region %s...", cfg.Metadata.Name, cfg.Spec.KubernetesVersion, cfg.Spec.Region)
+
+	// Ensure cleanup on failure unless retained
+	defer func() {
+		if err != nil && !retain {
+			klog.Errorf("❌ Cluster creation failed: %v", err)
+			klog.Info("🧹 Cleaning up resources (pass --retain to disable)...")
+			if cleanupErr := m.Delete(cfg.Metadata.Name); cleanupErr != nil {
+				klog.Errorf("⚠️  Failed to cleanup resources: %v", cleanupErr)
+			}
+		}
+	}()
+
+	if err = m.Preflight(); err != nil {
 		return err
 	}
-	klog.Infof("👑 Creating cluster '%s' in region '%s' (K8s %s)...\n", cfg.Metadata.Name, cfg.Spec.Region, cfg.Spec.KubernetesVersion)
 
 	// 1. Networking
 	for _, net := range cfg.Spec.Networks {
