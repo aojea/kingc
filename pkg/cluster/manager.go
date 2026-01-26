@@ -14,6 +14,7 @@ import (
 
 	"github.com/aojea/kingc/pkg/config"
 	"github.com/aojea/kingc/pkg/gce"
+	"k8s.io/klog/v2"
 )
 
 //go:embed templates/*
@@ -44,14 +45,14 @@ func (m *Manager) Create(cfg *config.Cluster) error {
 	if err := m.Preflight(); err != nil {
 		return err
 	}
-	fmt.Printf("👑 Creating cluster '%s' in region '%s' (K8s %s)...\n", cfg.Metadata.Name, cfg.Spec.Region, cfg.Spec.KubernetesVersion)
+	klog.Infof("👑 Creating cluster '%s' in region '%s' (K8s %s)...\n", cfg.Metadata.Name, cfg.Spec.Region, cfg.Spec.KubernetesVersion)
 
 	// 1. Networking
 	for _, net := range cfg.Spec.Networks {
 		netName := net.Name
 		isAuto := len(net.Subnets) == 0
 
-		fmt.Printf("  > Ensuring Network: %s (Auto: %v, MTU: %d, Profile: %s)\n", netName, isAuto, net.MTU, net.Profile)
+		klog.Infof("  > Ensuring Network: %s (Auto: %v, MTU: %d, Profile: %s)\n", netName, isAuto, net.MTU, net.Profile)
 
 		if !m.gce.NetworkExists(netName) {
 			if err := m.gce.CreateNetwork(netName, isAuto, net.MTU, net.Profile); err != nil {
@@ -69,7 +70,7 @@ func (m *Manager) Create(cfg *config.Cluster) error {
 	}
 
 	// 2. Load Balancer / Endpoint
-	fmt.Println("  > Reserving Regional External Passthrough Load Balancer IP...")
+	klog.Infof("  > Reserving Regional External Passthrough Load Balancer IP...")
 	// Use Control Plane region
 	lbIP, err := m.gce.EnsureStaticIP(fmt.Sprintf("%s-api", cfg.Metadata.Name), cfg.Spec.ControlPlane.Region)
 	if err != nil {
@@ -104,7 +105,7 @@ func (m *Manager) Create(cfg *config.Cluster) error {
 	}
 
 	// 4. Prepare Control Plane Config & Script
-	fmt.Println("  > Generating Kubeadm config...")
+	klog.Infof("  > Generating Kubeadm config...")
 	kubeadmConfig, err := m.renderTemplate("templates/kubeadm-config.yaml", templateData)
 	if err != nil {
 		return err
@@ -185,7 +186,7 @@ echo "👑 kingc: Control Plane Initialized"
 	// GCP External Passthrough LB delivers packets to the VM.
 	// Code update: Do NOT attach lbIP to CreateInstance.
 
-	fmt.Printf("  > Provisioning Control Plane VM (%s)...\n", cpZone)
+	klog.Infof("  > Provisioning Control Plane VM (%s)...", cpZone)
 	err = m.gce.CreateInstance(
 		cpName, cpZone, cfg.Spec.ControlPlane.MachineType,
 		cpNet, cpSub,
@@ -201,11 +202,11 @@ echo "👑 kingc: Control Plane Initialized"
 		},
 	)
 	if err != nil {
-		fmt.Printf("    (Instance warning: %v)\n", err)
+		klog.Warningf("    (Instance warning: %v)", err)
 	}
 
 	// 5b. Configure Regional Load Balancer Logic
-	fmt.Println("  > Configuring Regional Load Balancer...")
+	klog.Infof("  > Configuring Regional Load Balancer...")
 	baseName := cfg.Metadata.Name
 	region := cfg.Spec.ControlPlane.Region
 	hcName := baseName + "-hc"
@@ -215,40 +216,40 @@ echo "👑 kingc: Control Plane Initialized"
 
 	// Health Check
 	if err := m.gce.CreateRegionHealthCheck(hcName, region); err != nil {
-		fmt.Printf("    (HC warning: %v)\n", err)
+		klog.Warningf("    (HC warning: %v)", err)
 	}
 
 	// Instance Group (Unmanaged)
 	if err := m.gce.CreateUnmanagedInstanceGroup(igName, cpZone); err != nil {
-		fmt.Printf("    (IG warning: %v)\n", err)
+		klog.Warningf("    (IG warning: %v)", err)
 	}
 	// Add instance to IG
 	if err := m.gce.AddInstancesToGroup(igName, cpZone, cpName); err != nil {
-		fmt.Printf("    (AddInstance warning: %v)\n", err)
+		klog.Warningf("    (AddInstance warning: %v)", err)
 	}
 
 	// Backend Service
 	if err := m.gce.CreateRegionBackendService(bsName, region, hcName); err != nil {
-		fmt.Printf("    (BS warning: %v)\n", err)
+		klog.Warningf("    (BS warning: %v)", err)
 	}
 	// Add Backend
 	if err := m.gce.AddRegionBackend(bsName, region, igName, cpZone); err != nil {
-		fmt.Printf("    (AddBackend warning: %v)\n", err)
+		klog.Warningf("    (AddBackend warning: %v)", err)
 	}
 
 	// Forwarding Rule
 	if err := m.gce.CreateRegionForwardingRule(frName, region, bsName, lbIP); err != nil {
-		fmt.Printf("    (FR warning: %v)\n", err)
+		klog.Warningf("    (FR warning: %v)", err)
 	}
 
 	// 6. Wait for Control Plane Ready
-	fmt.Printf("  > Waiting for Kubernetes API Server (%s:6443) to be ready...\n", lbIP)
+	klog.Infof("  > Waiting for Kubernetes API Server (%s:6443) to be ready...", lbIP)
 	if err := m.waitForAPIServer(lbIP, 10*time.Minute); err != nil {
 		return fmt.Errorf("control plane failed to initialize: %v", err)
 	}
 
 	// 7. Worker Pools
-	fmt.Println("  > Provisioning Worker Groups...")
+	klog.Infof("  > Provisioning Worker Groups...")
 	tokenCmd := "sudo kubeadm token create --print-join-command"
 	joinCommand, _ := m.gce.RunSSHOutput(cpName, cpZone, tokenCmd)
 	joinCommand = strings.TrimSpace(joinCommand)
@@ -267,7 +268,7 @@ echo "👑 kingc: Joining cluster..."
 	defer os.Remove(tmpWorkerStartup.Name())
 
 	for _, grp := range cfg.Spec.WorkerGroups {
-		fmt.Printf("    [%s] Creating Instance Template and MIG (%d replicas) in %s...\n", grp.Name, grp.Replicas, grp.Zone)
+		klog.Infof("    [%s] Creating Instance Template and MIG (%d replicas) in %s...", grp.Name, grp.Replicas, grp.Zone)
 
 		var networks, subnets []string
 
@@ -297,7 +298,7 @@ echo "👑 kingc: Joining cluster..."
 				"kingc-group-" + grp.Name,
 			},
 		); err != nil {
-			fmt.Printf("    (Template warning: %v)\n", err)
+			klog.Warningf("    (Template warning: %v)", err)
 		}
 
 		migName := fmt.Sprintf("%s-%s-mig", cfg.Metadata.Name, grp.Name)
@@ -307,23 +308,23 @@ echo "👑 kingc: Joining cluster..."
 	}
 
 	// 8. Fetch Kubeconfig
-	fmt.Println("  > Fetching admin.conf...")
+	klog.Infof("  > Fetching admin.conf...")
 	localKubeconfig := fmt.Sprintf("%s.conf", cfg.Metadata.Name)
 	m.gce.SSH(cpName, cpZone, "sudo cp /etc/kubernetes/admin.conf ~/admin.conf && sudo chown $(whoami) ~/admin.conf")
 	m.gce.SCP(fmt.Sprintf("%s:~/admin.conf", cpName), localKubeconfig, cpZone)
 
-	fmt.Printf("✅ Cluster ready! Kubeconfig at: ./%s\n", localKubeconfig)
+	klog.Infof("✅ Cluster ready! Kubeconfig at: ./%s", localKubeconfig)
 	return nil
 }
 
 func (m *Manager) Delete(name string) error {
-	fmt.Printf("🗑️  Deleting cluster %s...\n", name)
+	klog.Infof("🗑️  Deleting cluster %s...\n", name)
 
 	// 1. Find Instances (Control Plane and Workers)
 	tags := []string{"kingc-cluster-" + name}
 	instances, err := m.gce.ListInstances(tags)
 	if err != nil {
-		fmt.Printf("⚠️  Error listing instances: %v\n", err)
+		klog.Errorf("⚠️  Error listing instances: %v\n", err)
 	}
 
 	// 2. Delete Instances
@@ -354,12 +355,12 @@ func (m *Manager) Delete(name string) error {
 	}
 
 	for _, inst := range instances {
-		fmt.Printf("  > Deleting instance %s in %s...\n", inst.Name, inst.Zone)
+		klog.Infof("  > Deleting instance %s in %s...\n", inst.Name, inst.Zone)
 		m.gce.Run("compute", "instances", "delete", inst.Name, "--zone", inst.Zone, "--quiet")
 	}
 
 	// 3. Delete Regional LB Resources (Best Effort)
-	fmt.Println("  > Cleaning up Regional Load Balancer resources...")
+	klog.Infof("  > Cleaning up Regional Load Balancer resources...")
 	baseName := name
 
 	// Need region. We can discover it from addresses? Or just iterate all addresses?
@@ -368,7 +369,7 @@ func (m *Manager) Delete(name string) error {
 	addressName := baseName + "-api"
 	addresses, err := m.gce.ListAddresses("name=" + addressName)
 	if err != nil {
-		fmt.Printf("⚠️  Error listing addresses: %v\n", err)
+		klog.Errorf("⚠️  Error listing addresses: %v\n", err)
 	}
 
 	// We can delete known resource names. But backend service and FR are regional.
@@ -396,30 +397,30 @@ func (m *Manager) Delete(name string) error {
 	}
 
 	for region := range targetRegions {
-		fmt.Printf("  > Cleaning up resources in region %s...\n", region)
+		klog.Infof("  > Cleaning up resources in region %s...\n", region)
 		if err := m.gce.DeleteRegionForwardingRule(baseName+"-fr", region); err != nil {
-			fmt.Printf("    (FR cleanup warning: %v)\n", err)
+			klog.Warningf("    (FR cleanup warning: %v)\n", err)
 		}
 		if err := m.gce.DeleteRegionBackendService(baseName+"-bs", region); err != nil {
-			fmt.Printf("    (BS cleanup warning: %v)\n", err)
+			klog.Warningf("    (BS cleanup warning: %v)\n", err)
 		}
 		if err := m.gce.DeleteRegionHealthCheck(baseName+"-hc", region); err != nil {
-			fmt.Printf("    (HC cleanup warning: %v)\n", err)
+			klog.Warningf("    (HC cleanup warning: %v)\n", err)
 		}
 	}
 
 	for zone := range zones {
 		if err := m.gce.DeleteUnmanagedInstanceGroup(baseName+"-cp-ig", zone); err != nil {
 			// This will fail for zones without the IG
-			// fmt.Printf("    (IG cleanup warning in %s: %v)\n", zone, err)
+			// klog.Warningf("    (IG cleanup warning in %s: %v)\n", zone, err)
 		}
 	}
 
 	// 4. Delete Addresses (Strictly <cluster>-api)
 	for _, addr := range addresses {
-		fmt.Printf("  > Deleting address %s (Region: %s)...\n", addr.Name, addr.Region)
+		klog.Infof("  > Deleting address %s (Region: %s)...\n", addr.Name, addr.Region)
 		if err := m.gce.DeleteAddress(addr.Name, addr.Region); err != nil {
-			fmt.Printf("    (IP cleanup warning: %v)\n", err)
+			klog.Warningf("    (IP cleanup warning: %v)\n", err)
 		}
 	}
 
