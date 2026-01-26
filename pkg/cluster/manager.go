@@ -312,61 +312,64 @@ echo "👑 kingc: Joining cluster..."
 func (m *Manager) Delete(name string) error {
 	klog.Infof("🗑️  Deleting cluster %s...\n", name)
 
-	// 1. Find Instances (Control Plane and Workers)
+	var errs []error
+
+	// 1. Delete Instance Groups
+	klog.Infof("  > Cleaning up Instance Groups...")
+	filter := fmt.Sprintf("name:%s*", name)
+	groups, err := m.gce.ListInstanceGroups(filter)
+	if err != nil {
+		klog.Warningf("    ⚠️  Failed to list instance groups: %v", err)
+		errs = append(errs, fmt.Errorf("list instance groups: %w", err))
+	} else {
+		for _, g := range groups {
+			if strings.Contains(g.Name, "mig") {
+				klog.Infof("  > Deleting MIG %s in %s...", g.Name, g.Zone)
+				if err := m.gce.DeleteMIG(g.Name, g.Zone); err != nil {
+					klog.Warningf("    ⚠️  Failed: %v", err)
+					errs = append(errs, fmt.Errorf("delete MIG %s: %w", g.Name, err))
+				} else {
+					klog.Infof("    ✅ Done")
+				}
+			} else {
+				klog.Infof("  > Deleting Unmanaged IG %s in %s...", g.Name, g.Zone)
+				if err := m.gce.DeleteUnmanagedInstanceGroup(g.Name, g.Zone); err != nil {
+					klog.Warningf("    ⚠️  Failed: %v", err)
+					errs = append(errs, fmt.Errorf("delete IG %s: %w", g.Name, err))
+				} else {
+					klog.Infof("    ✅ Done")
+				}
+			}
+		}
+	}
+
+	// 2. Delete Remaining Instances
 	tags := []string{"kingc-cluster-" + name}
 	instances, err := m.gce.ListInstances(tags)
 	if err != nil {
 		klog.Errorf("⚠️  Error listing instances: %v\n", err)
+		errs = append(errs, err)
+	} else {
+		for _, inst := range instances {
+			klog.Infof("  > Deleting Instance %s in %s...", inst.Name, inst.Zone)
+			if _, err := m.gce.Run("compute", "instances", "delete", inst.Name, "--zone", inst.Zone, "--quiet"); err != nil {
+				klog.Warningf("    ⚠️  Failed: %v", err)
+				errs = append(errs, fmt.Errorf("delete instance %s: %w", inst.Name, err))
+			} else {
+				klog.Infof("    ✅ Done")
+			}
+		}
 	}
 
-	// 2. Delete Instances
-	// Note: Deleting instances in a MIG might cause them to recreate.
-	// We should try to delete MIGs first.
-	// We can't easily list MIGs by label (GCE limit), so we rely on naming convention for MIGs.
-	// MIG Naming: <cluster>-<group>-mig
-	// If we don't know the groups, we might need to List ALL MIGs and filter by name pattern.
-	// For now, let's delete instances. If they are in a MIG, we might have trouble.
-	// We really should find the MIGs.
-	// Filter logic for MIGs is harder without ListMIGs support in our client.
-	// We'll proceed with instance deletion for MVP.
-
-	zones := make(map[string]bool)
-	for _, inst := range instances {
-		zones[inst.Zone] = true
-	}
-
-	// Also check default zone just in case
-	defaultZone := m.gce.GetDefaultZone()
-	if defaultZone != "" {
-		zones[defaultZone] = true
-	}
-
-	// For each zone found, list MIGs and check if they belong to cluster
-	for range zones {
-		// We don't have ListMIGs yet.
-	}
-
-	for _, inst := range instances {
-		klog.Infof("  > Deleting instance %s in %s...\n", inst.Name, inst.Zone)
-		_, _ = m.gce.Run("compute", "instances", "delete", inst.Name, "--zone", inst.Zone, "--quiet")
-	}
-
-	// 3. Delete Regional LB Resources (Best Effort)
-	klog.Infof("  > Cleaning up Regional Load Balancer resources...")
+	// 3. Delete Regional LB Resources
 	baseName := name
-
-	// Need region. We can discover it from addresses? Or just iterate all addresses?
-	// The address name is <cluster>-api.
-	// We can find the address first.
 	addressName := baseName + "-api"
+
 	addresses, err := m.gce.ListAddresses("name=" + addressName)
 	if err != nil {
 		klog.Errorf("⚠️  Error listing addresses: %v\n", err)
+		errs = append(errs, err)
 	}
-
-	// We can delete known resource names. But backend service and FR are regional.
-	// We should probably iterate regions found in addresses, or try to delete in default/all?
-	// We'll iterate regions found in addresses + regions from instances?
 
 	targetRegions := make(map[string]bool)
 	for _, addr := range addresses {
@@ -374,13 +377,7 @@ func (m *Manager) Delete(name string) error {
 			targetRegions[addr.Region] = true
 		}
 	}
-	// Fallback if no address found (maybe already deleted): try default region?
-	// Or maybe we can't delete BS/FR/HC if we don't know the region.
-	// We'll try regions from instances too.
-	// Map instance zone to region.
-
-	// If the user uses Delete, likely config is lost, so we must rely on discovery.
-
+	// Fallback to instance zones/regions
 	for _, inst := range instances {
 		if len(inst.Zone) > 2 {
 			reg := inst.Zone[:len(inst.Zone)-2]
@@ -389,31 +386,47 @@ func (m *Manager) Delete(name string) error {
 	}
 
 	for region := range targetRegions {
-		klog.Infof("  > Cleaning up resources in region %s...\n", region)
+		klog.Infof("  > Cleaning up LB Resources in %s...", region)
+		// FR
 		if err := m.gce.DeleteRegionForwardingRule(baseName+"-fr", region); err != nil {
-			klog.Warningf("    (FR cleanup warning: %v)\n", err)
+			klog.V(4).Infof("Ignored error deleting forwarding rule: %v", err)
 		}
+		// BS
 		if err := m.gce.DeleteRegionBackendService(baseName+"-bs", region); err != nil {
-			klog.Warningf("    (BS cleanup warning: %v)\n", err)
+			klog.V(4).Infof("Ignored error deleting backend service: %v", err)
 		}
+		// HC
 		if err := m.gce.DeleteRegionHealthCheck(baseName+"-hc", region); err != nil {
-			klog.Warningf("    (HC cleanup warning: %v)\n", err)
+			klog.V(4).Infof("Ignored error deleting health check: %v", err)
 		}
+		klog.Infof("    ✅ Done (Best Effort)")
 	}
 
-	for zone := range zones {
-		// Best effort delete of IG in all zones where instances were found
-		_ = m.gce.DeleteUnmanagedInstanceGroup(baseName+"-cp-ig", zone)
-	}
-
-	// 4. Delete Addresses (Strictly <cluster>-api)
+	// 4. Delete Addresses
 	for _, addr := range addresses {
-		klog.Infof("  > Deleting address %s (Region: %s)...\n", addr.Name, addr.Region)
+		klog.Infof("  > Deleting Address %s...", addr.Name)
 		if err := m.gce.DeleteAddress(addr.Name, addr.Region); err != nil {
-			klog.Warningf("    (IP cleanup warning: %v)\n", err)
+			klog.Warningf("    ⚠️  Failed: %v", err)
+			errs = append(errs, fmt.Errorf("delete address %s: %w", addr.Name, err))
+		} else {
+			klog.Infof("    ✅ Done")
 		}
 	}
 
+	// 5. Delete Firewall Rules
+	klog.Infof("  > Deleting Firewall Rules...")
+	rules := []string{name + "-internal", name + "-external"}
+	if _, err := m.gce.Run("compute", "firewall-rules", "delete", strings.Join(rules, " "), "--quiet"); err != nil {
+		klog.Warningf("    ⚠️  Failed: %v", err)
+		errs = append(errs, fmt.Errorf("delete firewall rules: %w", err))
+	} else {
+		klog.Infof("    ✅ Done")
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("cleanup failed with %d errors: %v", len(errs), errs)
+	}
+	klog.Infof("✨ Cluster %s deleted successfully", name)
 	return nil
 }
 
