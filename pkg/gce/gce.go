@@ -149,30 +149,6 @@ func (c *Client) EnsureStaticIP(name, region string) (string, error) {
 	return addr.Address, err
 }
 
-func (c *Client) EnsureGlobalAddress(name string) (string, error) {
-	type Address struct {
-		Address string `json:"address"`
-	}
-	var addr Address
-
-	err := c.RunJSON(&addr, "compute", "addresses", "describe", name, "--global")
-	if err == nil && addr.Address != "" {
-		return addr.Address, nil
-	}
-
-	if _, err := c.Run("compute", "addresses", "create", name, "--global"); err != nil && !IsAlreadyExistsError(err) {
-		return "", err
-	}
-
-	err = c.RunJSON(&addr, "compute", "addresses", "describe", name, "--global")
-	return addr.Address, err
-}
-
-func (c *Client) DeleteGlobalAddress(name string) error {
-	_, err := c.Run("compute", "addresses", "delete", name, "--global", "--quiet")
-	return err
-}
-
 func (c *Client) CreateInstance(name, zone, machineType, network, subnet, image, serviceAccount, startupScript, address string, tags []string) error {
 	args := []string{
 		"compute", "instances", "create", name,
