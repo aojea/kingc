@@ -8,7 +8,7 @@ import (
 
 type Cluster struct {
 	Version  string   `yaml:"version"`
-	Metadata Metadata `yaml:"metadata"`
+	Metadata Metadata `yaml:"-"`
 	Spec     Spec     `yaml:"spec"`
 }
 
@@ -95,6 +95,8 @@ func Default() *Cluster {
 		MachineType: DefaultWorkerMachineType,
 		DiskSizeGB:  DefaultDiskSizeGB,
 	}}
+
+	c.SetDefaults()
 
 	return c
 }

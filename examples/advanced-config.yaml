@@ -1,6 +1,4 @@
 version: v1alpha1
-metadata:
-  name: advanced-demo
 spec:
   region: us-central1
   kubernetesVersion: v1.35.0

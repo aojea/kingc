@@ -37,7 +37,7 @@ echo "  ✓ GCP Project: $PROJECT"
 
 # 2. Create Cluster
 echo "📦 Creating cluster from ${CONFIG_FILE}..."
-$KINGC_BIN create --config "${CONFIG_FILE}"
+$KINGC_BIN create --config "${CONFIG_FILE}" --name "${CLUSTER_NAME}"
 
 # 3. Validation
 echo "🧪 Validating Cluster..."
