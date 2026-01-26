@@ -185,7 +185,7 @@ echo "👑 kingc: Control Plane Initialized"
 
 	// 5b. Configure Regional Load Balancer Logic
 	klog.Infof("  > Configuring Regional Load Balancer...")
-	baseName := cfg.Metadata.Name
+	baseName := "kingc-cluster-" + cfg.Metadata.Name
 	region := cfg.Spec.ControlPlane.Region
 	hcName := baseName + "-hc"
 	bsName := baseName + "-bs"
@@ -222,8 +222,9 @@ echo "👑 kingc: Control Plane Initialized"
 
 	// 6. Wait for Control Plane Ready
 	klog.Infof("  > Waiting for Kubernetes API Server (%s:6443) to be ready...", lbIP)
-	if err := m.waitForAPIServer(lbIP, 10*time.Minute); err != nil {
-		return fmt.Errorf("control plane failed to initialize: %v", err)
+	timeout := 5 * time.Minute
+	if err := m.waitForAPIServer(lbIP, timeout); err != nil {
+		return fmt.Errorf("control plane failed to initialize after %v: %v", timeout, err)
 	}
 
 	// 7. Worker Pools
