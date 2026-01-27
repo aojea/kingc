@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/aojea/kingc/pkg/config"
+	"k8s.io/klog/v2"
 )
 
 type Client struct {
@@ -296,15 +297,53 @@ func (c *Client) DeleteAddress(ctx context.Context, name, region string) error {
 	return err
 }
 
-func (c *Client) SSH(ctx context.Context, instance, zone, command string) error {
-	cmd := exec.CommandContext(ctx, "gcloud", "compute", "ssh", instance, "--zone", zone, "--command", command, "--", "-t", "-q")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+func (c *Client) SSH(ctx context.Context, instance, zone string, cmd []string) error {
+	// Attempt 1: Try with default SSH config (respects user settings/agents)
+	args := []string{"compute", "ssh", instance, "--zone", zone}
+	if len(cmd) > 0 {
+		args = append(args, "--command", strings.Join(cmd, " "))
+	}
+	// We only care about error here, output is piped if Verbosity is set via Run
+	_, err := c.Run(ctx, args...)
+	if err == nil {
+		return nil
+	}
+
+	// Attempt 2: Retry with config bypass if the first attempt failed
+	// This handles cases like corp-ssh-helper prompts or bad proxy configs hanging/failing
+	klog.V(2).Infof("SSH attempt 1 to %s failed (%v), retrying with -F /dev/null", instance, err)
+
+	argsRetry := []string{"compute", "ssh", instance, "--zone", zone, "--ssh-flag=-F /dev/null"}
+	if len(cmd) > 0 {
+		argsRetry = append(argsRetry, "--command", strings.Join(cmd, " "))
+	}
+
+	_, err2 := c.Run(ctx, argsRetry...)
+	if err2 == nil {
+		klog.Warningf("SSH connection to %s succeeded only after bypassing local SSH config (-F /dev/null). Check your ~/.ssh/config for incompatibility.", instance)
+		return nil
+	}
+
+	// Return combined error to help debugging
+	return fmt.Errorf("ssh failed (default config: %v) (bypass config: %v)", err, err2)
 }
 
 func (c *Client) RunSSHOutput(ctx context.Context, instance, zone, command string) (string, error) {
-	return c.Run(ctx, "compute", "ssh", instance, "--zone", zone, "--command", command, "--", "-q")
+	// Attempt 1
+	out, err := c.Run(ctx, "compute", "ssh", instance, "--zone", zone, "--command", command, "--", "-q")
+	if err == nil {
+		return out, nil
+	}
+
+	// Attempt 2
+	klog.V(2).Infof("RunSSHOutput attempt 1 to %s failed (%v), retrying with -F /dev/null", instance, err)
+	out2, err2 := c.Run(ctx, "compute", "ssh", instance, "--zone", zone, "--ssh-flag=-F /dev/null", "--command", command, "--", "-q")
+	if err2 == nil {
+		klog.Warningf("SSH command to %s succeeded only after bypassing local SSH config (-F /dev/null).", instance)
+		return out2, nil
+	}
+
+	return "", fmt.Errorf("ssh command failed (default: %v) (bypass: %v)", err, err2)
 }
 
 func (c *Client) SCP(ctx context.Context, localPath, remotePath, zone string) error {
