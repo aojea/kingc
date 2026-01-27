@@ -15,6 +15,8 @@ import (
 	"k8s.io/klog/v2"
 )
 
+const version = "v0.1.0"
+
 var (
 	rootCmd = &cobra.Command{
 		Use:   "kingc",
@@ -84,7 +86,7 @@ It attempts to mimic the behavior and user experience of 'kind' but for GCE.`,
 		Use:   "version",
 		Short: "Prints the kingc CLI version",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Println("kingc v0.1.0")
+			fmt.Println("kingc " + version)
 		},
 	}
 )
