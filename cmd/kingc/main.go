@@ -10,6 +10,7 @@ import (
 
 	"github.com/aojea/kingc/pkg/cluster"
 	"github.com/aojea/kingc/pkg/config"
+	"github.com/aojea/kingc/pkg/gce"
 	"github.com/spf13/cobra"
 	"k8s.io/klog/v2"
 )
@@ -92,6 +93,8 @@ func init() {
 	// Root flags
 	rootCmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
 	rootCmd.PersistentFlags().BoolP("quiet", "q", false, "silence all stderr output")
+	rootCmd.PersistentFlags().StringP("verbosity", "v", "warning", "gcloud verbosity level (debug, info, warning, error, critical, none)")
+	rootCmd.PersistentFlags().Bool("no-user-output-enabled", false, "suppress command output to standard output and standard error (gcloud)")
 
 	rootCmd.PersistentPreRun = func(cmd *cobra.Command, args []string) {
 		quiet, _ := cmd.Flags().GetBool("quiet")
@@ -194,6 +197,18 @@ func main() {
 	}
 }
 
+func getClient(cmd *cobra.Command) *gce.Client {
+	verbosity, _ := cmd.Flags().GetString("verbosity")
+	quiet, _ := cmd.Flags().GetBool("quiet")
+	noUserOutput, _ := cmd.Flags().GetBool("no-user-output-enabled")
+
+	return gce.NewClient(
+		gce.WithVerbosity(verbosity),
+		gce.WithQuiet(quiet),
+		gce.WithNoUserOutput(noUserOutput),
+	)
+}
+
 func runCreateCluster(cmd *cobra.Command, args []string) {
 	configFile, _ := cmd.Flags().GetString("config")
 	var cfg *config.Cluster
@@ -219,8 +234,9 @@ func runCreateCluster(cmd *cobra.Command, args []string) {
 	}
 
 	retain, _ := cmd.Flags().GetBool("retain")
+	client := getClient(cmd)
 
-	if err := cluster.NewManager().Create(cmd.Context(), cfg, retain); err != nil {
+	if err := cluster.NewManager(client).Create(cmd.Context(), cfg, retain); err != nil {
 		// If the error was context cancelled, we might have already logged/cleaned up
 		if cmd.Context().Err() != nil {
 			// Don't fatal here if we already handled cleanup in Create
@@ -232,14 +248,16 @@ func runCreateCluster(cmd *cobra.Command, args []string) {
 
 func runDeleteCluster(cmd *cobra.Command, args []string) {
 	name, _ := cmd.Flags().GetString("name")
+	client := getClient(cmd)
 
-	if err := cluster.NewManager().Delete(cmd.Context(), name); err != nil {
+	if err := cluster.NewManager(client).Delete(cmd.Context(), name); err != nil {
 		klog.Fatalf("❌ Error deleting cluster: %v", err)
 	}
 }
 
 func runGetClusters(cmd *cobra.Command, args []string) {
-	clusters, err := cluster.NewManager().ListClusters(cmd.Context())
+	client := getClient(cmd)
+	clusters, err := cluster.NewManager(client).ListClusters(cmd.Context())
 	if err != nil {
 		klog.Fatalf("❌ Error listing clusters: %v", err)
 	}
@@ -250,7 +268,8 @@ func runGetClusters(cmd *cobra.Command, args []string) {
 
 func runGetNodes(cmd *cobra.Command, args []string) {
 	name, _ := cmd.Flags().GetString("name")
-	nodes, err := cluster.NewManager().ListNodes(cmd.Context(), name)
+	client := getClient(cmd)
+	nodes, err := cluster.NewManager(client).ListNodes(cmd.Context(), name)
 	if err != nil {
 		klog.Fatalf("❌ Error listing nodes for cluster %s: %v", name, err)
 	}
@@ -267,7 +286,8 @@ func runGetNodes(cmd *cobra.Command, args []string) {
 
 func runGetKubeconfig(cmd *cobra.Command, args []string) {
 	name, _ := cmd.Flags().GetString("name")
-	kc, err := cluster.NewManager().GetKubeconfig(cmd.Context(), name)
+	client := getClient(cmd)
+	kc, err := cluster.NewManager(client).GetKubeconfig(cmd.Context(), name)
 	if err != nil {
 		klog.Fatalf("❌ Error retrieving kubeconfig: %v", err)
 	}
@@ -280,7 +300,8 @@ func runExportLogs(cmd *cobra.Command, args []string) {
 	if len(args) > 0 {
 		outDir = args[0]
 	}
-	if err := cluster.NewManager().ExportLogs(cmd.Context(), name, outDir); err != nil {
+	client := getClient(cmd)
+	if err := cluster.NewManager(client).ExportLogs(cmd.Context(), name, outDir); err != nil {
 		klog.Fatalf("❌ Error exporting logs: %v", err)
 	}
 	klog.Infof("✅ Logs exported to %s", outDir)

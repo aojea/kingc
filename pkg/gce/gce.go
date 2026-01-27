@@ -1,6 +1,7 @@
 package gce
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,15 +12,63 @@ import (
 	"github.com/aojea/kingc/pkg/config"
 )
 
-type Client struct{}
+type Client struct {
+	Verbosity    string
+	Quiet        bool
+	NoUserOutput bool
+}
 
-func NewClient() *Client {
-	return &Client{}
+type ClientOption func(*Client)
+
+func WithVerbosity(v string) ClientOption {
+	return func(c *Client) {
+		c.Verbosity = v
+	}
+}
+
+func WithQuiet(q bool) ClientOption {
+	return func(c *Client) {
+		c.Quiet = q
+	}
+}
+
+func WithNoUserOutput(n bool) ClientOption {
+	return func(c *Client) {
+		c.NoUserOutput = n
+	}
+}
+
+func NewClient(opts ...ClientOption) *Client {
+	c := &Client{}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}
+
+func (c *Client) argsWithVerbosity(args []string) []string {
+	if c.Verbosity != "" {
+		args = append(args, "--verbosity", c.Verbosity)
+	}
+	if c.Quiet {
+		args = append(args, "--quiet")
+	}
+	if c.NoUserOutput {
+		args = append(args, "--no-user-output-enabled")
+	}
+	return args
 }
 
 func (c *Client) Run(ctx context.Context, args ...string) (string, error) {
+	args = c.argsWithVerbosity(args)
 	cmd := exec.CommandContext(ctx, "gcloud", args...)
 	cmd.Env = os.Environ()
+	// If verbosity is set, we might want to see stderr even if we capture output?
+	// CombinedOutput captures both.
+	// If NoUserOutput is set, standard output/error are suppressed by gcloud itself,
+	// but we still might get something specific if we ask?
+	// Actually --no-user-output-enabled suppresses printing to terminal, but we are capturing it.
+	// Let's stick to standard behavior: Run returns CombinedOutput.
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("command failed: gcloud %s: %v\nOutput: %s", strings.Join(args, " "), err, string(out))
@@ -28,20 +77,41 @@ func (c *Client) Run(ctx context.Context, args ...string) (string, error) {
 }
 
 // RunQuiet executes a command and returns only its stdout.
-// Stderr is ignored/discarded to prevent pollution of JSON output with warnings.
+// Stderr is ignored/discarded to prevent pollution of JSON output with warnings,
+// UNLESS verbosity is requested, in which case we stream Stderr to os.Stderr.
 func (c *Client) RunQuiet(ctx context.Context, args ...string) (string, error) {
+	args = c.argsWithVerbosity(args)
 	cmd := exec.CommandContext(ctx, "gcloud", args...)
 	cmd.Env = os.Environ()
-	// We only want Stdout
-	out, err := cmd.Output()
+
+	// We only want Stdout for the return value
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	// If Verbosity is set (and not "none"), we likely want to see logs (stderr) for debugging.
+	// RunQuiet is typically used for JSON commands where we parse stdout.
+	// If we mix stderr into stdout, JSON parsing fails.
+	// So we must separate them.
+	if c.Verbosity != "" && c.Verbosity != "none" {
+		cmd.Stderr = os.Stderr
+	} else {
+		// Discard stderr by default or if quiet?
+		// RunQuiet implies we don't want noise.
+		// But if error happens, we want to know why.
+		// The original implementation just discarded stderr via cmd.Output() (which captures stdout only).
+		// We'll mimic that unless verbosity is explicitly enabled.
+	}
+
+	err := cmd.Run()
 	if err != nil {
-		// If exit error, we might want to capture stderr for debugging?
-		// But cmd.Output() returns exit error which doesn't include stderr by default.
-		// Let's rely on the fact that if it failed, we return error.
-		// If we want stderr in error message, we need to capture it separately.
+		// If we failed, strict return error.
+		// If we were piping stderr to os.Stderr, user sees it.
+		// If not, maybe we should include it in error?
+		// But we didn't capture it if we didn't pipe it or capture it.
+		// Let's rely on gcloud --verbosity providing enough info to stderr if connected.
 		return "", fmt.Errorf("command failed: gcloud %s: %v", strings.Join(args, " "), err)
 	}
-	return string(out), nil
+	return stdout.String(), nil
 }
 
 // RunJSON executes a gcloud command and unmarshals the output into the provided struct
