@@ -42,7 +42,16 @@ func (m *Manager) Preflight(ctx context.Context) error {
 	return nil
 }
 
+func (m *Manager) measure(step string) func() {
+	start := time.Now()
+	klog.V(2).Infof("⏱️  [Start] %s", step)
+	return func() {
+		klog.Infof("⏱️  [Timing] %s took %v", step, time.Since(start))
+	}
+}
+
 func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) (err error) {
+	defer m.measure("Create Cluster " + cfg.Metadata.Name)()
 	klog.Infof("🚀 Creating cluster '%s' (v%s) in region %s...", cfg.Metadata.Name, cfg.Spec.KubernetesVersion, cfg.Spec.Region)
 
 	// Ensure cleanup on failure unless retained
@@ -61,33 +70,40 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 	}
 
 	// 1. Networking
-	for _, net := range cfg.Spec.Networks {
-		netName := net.Name
-		isAuto := len(net.Subnets) == 0
+	{
+		defer m.measure("Networking Setup")()
+		for _, net := range cfg.Spec.Networks {
+			netName := net.Name
+			isAuto := len(net.Subnets) == 0
 
-		klog.Infof("  > Ensuring Network: %s (Auto: %v, MTU: %d, Profile: %s)\n", netName, isAuto, net.MTU, net.Profile)
+			klog.Infof("  > Ensuring Network: %s (Auto: %v, MTU: %d, Profile: %s)\n", netName, isAuto, net.MTU, net.Profile)
 
-		if !m.gce.NetworkExists(ctx, netName) {
-			if err := m.gce.CreateNetwork(ctx, netName, isAuto, net.MTU, net.Profile); err != nil {
-				return err
-			}
-			for _, sub := range net.Subnets {
-				if err := m.gce.CreateSubnet(ctx, sub.Name, netName, cfg.Spec.Region, sub.CIDR); err != nil {
+			if !m.gce.NetworkExists(ctx, netName) {
+				if err := m.gce.CreateNetwork(ctx, netName, isAuto, net.MTU, net.Profile); err != nil {
 					return err
 				}
-			}
-			if err := m.gce.CreateFirewallRules(ctx, cfg.Metadata.Name, netName); err != nil {
-				return err
+				for _, sub := range net.Subnets {
+					if err := m.gce.CreateSubnet(ctx, sub.Name, netName, cfg.Spec.Region, sub.CIDR); err != nil {
+						return err
+					}
+				}
+				if err := m.gce.CreateFirewallRules(ctx, cfg.Metadata.Name, netName); err != nil {
+					return err
+				}
 			}
 		}
 	}
 
 	// 2. Load Balancer / Endpoint
-	klog.Infof("  > Reserving Regional External Passthrough Load Balancer IP...")
-	// Use Control Plane region
-	lbIP, err := m.gce.EnsureStaticIP(ctx, fmt.Sprintf("%s-api", cfg.Metadata.Name), cfg.Spec.ControlPlane.Region)
-	if err != nil {
-		return err
+	var lbIP string
+	{
+		defer m.measure("Load Balancer Reservation")()
+		klog.Infof("  > Reserving Regional External Passthrough Load Balancer IP...")
+		// Use Control Plane region
+		lbIP, err = m.gce.EnsureStaticIP(ctx, fmt.Sprintf("%s-api", cfg.Metadata.Name), cfg.Spec.ControlPlane.Region)
+		if err != nil {
+			return err
+		}
 	}
 
 	// 3. Prepare Base Scripts (Pass Version info)
@@ -155,90 +171,99 @@ echo "👑 kingc: Control Plane Initialized"
 	defer func() { _ = os.Remove(tmpCPStartup.Name()) }()
 
 	// 5. Provision Control Plane
-	if len(cfg.Spec.Networks) == 0 {
-		return fmt.Errorf("no networks defined in spec")
-	}
+	var cpName, cpZone, cpNet, cpSub string
+	{
+		defer m.measure("Control Plane Provisioning")()
+		if len(cfg.Spec.Networks) == 0 {
+			return fmt.Errorf("no networks defined in spec")
+		}
 
-	cpNet := cfg.Spec.Networks[0].Name
-	cpSub, err := resolveSubnet(cfg.Spec.Networks, cpNet, "")
-	if err != nil {
-		return fmt.Errorf("resolving CP network: %v", err)
-	}
+		cpNet = cfg.Spec.Networks[0].Name
+		cpSub, err = resolveSubnet(cfg.Spec.Networks, cpNet, "")
+		if err != nil {
+			return fmt.Errorf("resolving CP network: %v", err)
+		}
 
-	cpZone := cfg.Spec.ControlPlane.Zone
-	cpName := fmt.Sprintf("%s-cp", cfg.Metadata.Name)
+		cpZone = cfg.Spec.ControlPlane.Zone
+		cpName = fmt.Sprintf("%s-cp", cfg.Metadata.Name)
 
-	// GCP External Passthrough LB delivers packets to the VM.
-	klog.Infof("  > Provisioning Control Plane VM (%s)...", cpZone)
-	err = m.gce.CreateInstance(
-		ctx,
-		cpName, cpZone, cfg.Spec.ControlPlane.MachineType,
-		cpNet, cpSub,
-		config.DefaultImageFamily, "", tmpCPStartup.Name(),
-		"",
-		[]string{
-			basename(cfg.Metadata.Name),
-			"kingc-role-control-plane",
-		},
-	)
-	if err != nil {
-		klog.Warningf("    (Instance warning: %v)", err)
-	}
+		// GCP External Passthrough LB delivers packets to the VM.
+		klog.Infof("  > Provisioning Control Plane VM (%s)...", cpZone)
+		err = m.gce.CreateInstance(
+			ctx,
+			cpName, cpZone, cfg.Spec.ControlPlane.MachineType,
+			cpNet, cpSub,
+			config.DefaultImageFamily, "", tmpCPStartup.Name(),
+			"",
+			[]string{
+				basename(cfg.Metadata.Name),
+				"kingc-role-control-plane",
+			},
+		)
+		if err != nil {
+			klog.Warningf("    (Instance warning: %v)", err)
+		}
 
-	// 5b. Configure Regional Load Balancer Logic
-	klog.Infof("  > Configuring Regional Load Balancer...")
-	baseName := basename(cfg.Metadata.Name)
-	region := cfg.Spec.ControlPlane.Region
-	hcName := baseName + "-hc"
-	bsName := baseName + "-bs"
-	frName := baseName + "-fr"
-	igName := baseName + "-cp-ig" // Unmanaged Instance Group for CP
+		// 5b. Configure Regional Load Balancer Logic
+		klog.Infof("  > Configuring Regional Load Balancer...")
+		baseName := basename(cfg.Metadata.Name)
+		region := cfg.Spec.ControlPlane.Region
+		hcName := baseName + "-hc"
+		bsName := baseName + "-bs"
+		frName := baseName + "-fr"
+		igName := baseName + "-cp-ig" // Unmanaged Instance Group for CP
 
-	// Health Check
-	if err := m.gce.CreateRegionHealthCheck(ctx, hcName, region); err != nil {
-		klog.Warningf("    (HC warning: %v)", err)
-	}
+		// Health Check
+		if err := m.gce.CreateRegionHealthCheck(ctx, hcName, region); err != nil {
+			klog.Warningf("    (HC warning: %v)", err)
+		}
 
-	// Instance Group (Unmanaged)
-	if err := m.gce.CreateUnmanagedInstanceGroup(ctx, igName, cpZone); err != nil {
-		klog.Warningf("    (IG warning: %v)", err)
-	}
-	// Add instance to IG
-	if err := m.gce.AddInstancesToGroup(ctx, igName, cpZone, cpName); err != nil {
-		klog.Warningf("    (AddInstance warning: %v)", err)
-	}
+		// Instance Group (Unmanaged)
+		if err := m.gce.CreateUnmanagedInstanceGroup(ctx, igName, cpZone); err != nil {
+			klog.Warningf("    (IG warning: %v)", err)
+		}
+		// Add instance to IG
+		if err := m.gce.AddInstancesToGroup(ctx, igName, cpZone, cpName); err != nil {
+			klog.Warningf("    (AddInstance warning: %v)", err)
+		}
 
-	// Backend Service
-	if err := m.gce.CreateRegionBackendService(ctx, bsName, region, hcName); err != nil {
-		klog.Warningf("    (BS warning: %v)", err)
-	}
-	// Add Backend
-	if err := m.gce.AddRegionBackend(ctx, bsName, region, igName, cpZone); err != nil {
-		klog.Warningf("    (AddBackend warning: %v)", err)
-	}
+		// Backend Service
+		if err := m.gce.CreateRegionBackendService(ctx, bsName, region, hcName); err != nil {
+			klog.Warningf("    (BS warning: %v)", err)
+		}
+		// Add Backend
+		if err := m.gce.AddRegionBackend(ctx, bsName, region, igName, cpZone); err != nil {
+			klog.Warningf("    (AddBackend warning: %v)", err)
+		}
 
-	// Forwarding Rule
-	if err := m.gce.CreateRegionForwardingRule(ctx, frName, region, bsName, lbIP); err != nil {
-		klog.Warningf("    (FR warning: %v)", err)
+		// Forwarding Rule
+		if err := m.gce.CreateRegionForwardingRule(ctx, frName, region, bsName, lbIP); err != nil {
+			klog.Warningf("    (FR warning: %v)", err)
+		}
 	}
 
 	// 6. Wait for Control Plane Ready
-	klog.Infof("  > Waiting for Kubernetes API Server (%s:6443) to be ready...", lbIP)
-	timeout := 5 * time.Minute
-	if err := m.waitForAPIServer(ctx, lbIP, timeout); err != nil {
-		return fmt.Errorf("control plane failed to initialize after %v: %v", timeout, err)
+	{
+		defer m.measure("Wait for API Server")()
+		klog.Infof("  > Waiting for Kubernetes API Server (%s:6443) to be ready...", lbIP)
+		timeout := 5 * time.Minute
+		if err := m.waitForAPIServer(ctx, lbIP, timeout); err != nil {
+			return fmt.Errorf("control plane failed to initialize after %v: %v", timeout, err)
+		}
 	}
 
 	// 7. Worker Pools
-	klog.Infof("  > Provisioning Worker Groups...")
-	tokenCmd := "sudo /usr/bin/kubeadm token create --print-join-command"
-	joinCommand, err := m.gce.RunSSHOutput(ctx, cpName, cpZone, tokenCmd)
-	if err != nil {
-		return fmt.Errorf("failed to get join command: %v", err)
-	}
-	joinCommand = strings.TrimSpace(joinCommand)
+	{
+		defer m.measure("Worker Groups Provisioning")()
+		klog.Infof("  > Provisioning Worker Groups...")
+		tokenCmd := "sudo /usr/bin/kubeadm token create --print-join-command"
+		joinCommand, err := m.gce.RunSSHOutput(ctx, cpName, cpZone, tokenCmd)
+		if err != nil {
+			return fmt.Errorf("failed to get join command: %v", err)
+		}
+		joinCommand = strings.TrimSpace(joinCommand)
 
-	workerStartup := fmt.Sprintf(`%s
+		workerStartup := fmt.Sprintf(`%s
 
 # ---------------------------------------------------------
 # Worker Bootstrap
@@ -247,214 +272,237 @@ echo "👑 kingc: Joining cluster..."
 %s --ignore-preflight-errors=NumCPU
 `, baseInstallScript, joinCommand)
 
-	tmpWorkerStartup, err := os.CreateTemp("", "worker-startup-*.sh")
-	if err != nil {
-		return fmt.Errorf("failed to create worker startup script: %v", err)
-	}
-	if err := os.WriteFile(tmpWorkerStartup.Name(), []byte(workerStartup), 0644); err != nil {
-		return fmt.Errorf("failed to write worker startup script: %v", err)
-	}
-	defer func() { _ = os.Remove(tmpWorkerStartup.Name()) }()
+		tmpWorkerStartup, err := os.CreateTemp("", "worker-startup-*.sh")
+		if err != nil {
+			return fmt.Errorf("failed to create worker startup script: %v", err)
+		}
+		if err := os.WriteFile(tmpWorkerStartup.Name(), []byte(workerStartup), 0644); err != nil {
+			return fmt.Errorf("failed to write worker startup script: %v", err)
+		}
+		defer func() { _ = os.Remove(tmpWorkerStartup.Name()) }()
 
-	for _, grp := range cfg.Spec.WorkerGroups {
-		klog.Infof("    [%s] Creating Instance Template and MIG (%d replicas) in %s...", grp.Name, grp.Replicas, grp.Zone)
+		for _, grp := range cfg.Spec.WorkerGroups {
+			klog.Infof("    [%s] Creating Instance Template and MIG (%d replicas) in %s...", grp.Name, grp.Replicas, grp.Zone)
 
-		var networks, subnets []string
+			var networks, subnets []string
 
-		if len(grp.Interfaces) > 0 {
-			for _, iface := range grp.Interfaces {
-				netName := iface.Network
-				subName, err := resolveSubnet(cfg.Spec.Networks, netName, iface.Subnet)
-				if err != nil {
-					return err
+			if len(grp.Interfaces) > 0 {
+				for _, iface := range grp.Interfaces {
+					netName := iface.Network
+					subName, err := resolveSubnet(cfg.Spec.Networks, netName, iface.Subnet)
+					if err != nil {
+						return err
+					}
+
+					networks = append(networks, netName)
+					subnets = append(subnets, subName)
 				}
-
-				networks = append(networks, netName)
-				subnets = append(subnets, subName)
+			} else {
+				networks = []string{cpNet}
+				subnets = []string{cpSub}
 			}
-		} else {
-			networks = []string{cpNet}
-			subnets = []string{cpSub}
-		}
 
-		tmplName := fmt.Sprintf("%s-%s-tmpl", cfg.Metadata.Name, grp.Name)
-		if err := m.gce.CreateInstanceTemplate(
-			ctx,
-			tmplName, grp.MachineType, networks, subnets,
-			config.DefaultImageFamily, tmpWorkerStartup.Name(),
-			[]string{
-				basename(cfg.Metadata.Name),
-				"kingc-role-worker",
-				"kingc-group-" + grp.Name,
-			},
-		); err != nil {
-			klog.Warningf("    (Template warning: %v)", err)
-		}
+			tmplName := fmt.Sprintf("%s-%s-tmpl", cfg.Metadata.Name, grp.Name)
+			if err := m.gce.CreateInstanceTemplate(
+				ctx,
+				tmplName, grp.MachineType, networks, subnets,
+				config.DefaultImageFamily, tmpWorkerStartup.Name(),
+				[]string{
+					basename(cfg.Metadata.Name),
+					"kingc-role-worker",
+					"kingc-group-" + grp.Name,
+				},
+			); err != nil {
+				klog.Warningf("    (Template warning: %v)", err)
+			}
 
-		migName := fmt.Sprintf("%s-%s-mig", cfg.Metadata.Name, grp.Name)
-		if err := m.gce.CreateMIG(ctx, migName, tmplName, grp.Zone, grp.Replicas); err != nil {
-			return err
+			migName := fmt.Sprintf("%s-%s-mig", cfg.Metadata.Name, grp.Name)
+			if err := m.gce.CreateMIG(ctx, migName, tmplName, grp.Zone, grp.Replicas); err != nil {
+				return err
+			}
 		}
 	}
 
 	// 8. Fetch Kubeconfig
-	klog.Infof("  > Fetching admin.conf...")
-	localKubeconfig := fmt.Sprintf("%s.conf", cfg.Metadata.Name)
-	// We should check error here
-	if err := m.gce.SSH(ctx, cpName, cpZone, "sudo cp /etc/kubernetes/admin.conf ~/admin.conf && sudo chown $(whoami) ~/admin.conf"); err != nil {
-		klog.Warningf("    (SSH warning: %v)", err)
-	}
-	if err := m.gce.SCP(ctx, fmt.Sprintf("%s:~/admin.conf", cpName), localKubeconfig, cpZone); err != nil {
-		klog.Warningf("    (SCP warning: %v)", err)
-	}
+	{
+		defer m.measure("Fetch Kubeconfig")()
+		klog.Infof("  > Fetching admin.conf...")
+		localKubeconfig := fmt.Sprintf("%s.conf", cfg.Metadata.Name)
+		// We should check error here
+		if err := m.gce.SSH(ctx, cpName, cpZone, "sudo cp /etc/kubernetes/admin.conf ~/admin.conf && sudo chown $(whoami) ~/admin.conf"); err != nil {
+			klog.Warningf("    (SSH warning: %v)", err)
+		}
+		if err := m.gce.SCP(ctx, fmt.Sprintf("%s:~/admin.conf", cpName), localKubeconfig, cpZone); err != nil {
+			klog.Warningf("    (SCP warning: %v)", err)
+		}
 
-	klog.Infof("✅ Cluster ready! Kubeconfig at: ./%s", localKubeconfig)
+		klog.Infof("✅ Cluster ready! Kubeconfig at: ./%s", localKubeconfig)
+	}
 	return nil
 }
 
 func (m *Manager) Delete(ctx context.Context, name string) error {
+	defer m.measure("Delete Cluster " + name)()
 	klog.Infof("🗑️  Deleting cluster %s...\n", name)
 
 	var errs []error
 
 	// 1. Delete Regional LB Resources (Dependencies for Instance Groups)
-	baseName := basename(name)
-	addressName := baseName + "-api"
+	var instances []gce.Instance
+	var addresses []gce.Address
+	{
+		defer m.measure("LB Resources Cleanup")()
+		baseName := basename(name)
+		addressName := baseName + "-api"
 
-	// Gather regions from all possible regional resources
-	targetRegions := make(map[string]bool)
+		// Gather regions from all possible regional resources
+		targetRegions := make(map[string]bool)
 
-	// A. Check Addresses
-	addresses, err := m.gce.ListAddresses(ctx, "name="+addressName)
-	if err != nil {
-		klog.Warningf("    ⚠️  Failed to list addresses: %v", err)
-	} else {
-		for _, addr := range addresses {
-			if addr.Region != "" {
-				targetRegions[addr.Region] = true
+		// A. Check Addresses
+		var err error
+		addresses, err = m.gce.ListAddresses(ctx, "name="+addressName)
+		if err != nil {
+			klog.Warningf("    ⚠️  Failed to list addresses: %v", err)
+		} else {
+			for _, addr := range addresses {
+				if addr.Region != "" {
+					targetRegions[addr.Region] = true
+				}
 			}
 		}
-	}
 
-	// B. Check Forwarding Rules
-	frs, err := m.gce.ListForwardingRules(ctx, "name:"+baseName+"*")
-	if err != nil {
-		klog.Warningf("    ⚠️  Failed to list forwarding rules: %v", err)
-	} else {
-		for _, fr := range frs {
-			if fr.Region != "" {
-				targetRegions[fr.Region] = true
+		// B. Check Forwarding Rules
+		frs, err := m.gce.ListForwardingRules(ctx, "name:"+baseName+"*")
+		if err != nil {
+			klog.Warningf("    ⚠️  Failed to list forwarding rules: %v", err)
+		} else {
+			for _, fr := range frs {
+				if fr.Region != "" {
+					targetRegions[fr.Region] = true
+				}
 			}
 		}
-	}
 
-	// C. Check Backend Services
-	bss, err := m.gce.ListBackendServices(ctx, "name:"+baseName+"*")
-	if err != nil {
-		klog.Warningf("    ⚠️  Failed to list backend services: %v", err)
-	} else {
-		for _, bs := range bss {
-			if bs.Region != "" {
-				targetRegions[bs.Region] = true
+		// C. Check Backend Services
+		bss, err := m.gce.ListBackendServices(ctx, "name:"+baseName+"*")
+		if err != nil {
+			klog.Warningf("    ⚠️  Failed to list backend services: %v", err)
+		} else {
+			for _, bs := range bss {
+				if bs.Region != "" {
+					targetRegions[bs.Region] = true
+				}
 			}
 		}
-	}
 
-	// We also verify instances to find regions if address is missing
-	tags := []string{basename(name)}
-	instances, err := m.gce.ListInstances(ctx, tags)
-	if err != nil {
-		klog.Warningf("    ⚠️  Failed to list instances: %v", err)
-	} else {
-		for _, inst := range instances {
-			if len(inst.Zone) > 2 {
-				reg := inst.Zone[:len(inst.Zone)-2]
-				targetRegions[reg] = true
+		// We also verify instances to find regions if address is missing
+		tags := []string{basename(name)}
+		instances, err = m.gce.ListInstances(ctx, tags)
+		if err != nil {
+			klog.Warningf("    ⚠️  Failed to list instances: %v", err)
+		} else {
+			for _, inst := range instances {
+				if len(inst.Zone) > 2 {
+					reg := inst.Zone[:len(inst.Zone)-2]
+					targetRegions[reg] = true
+				}
 			}
 		}
-	}
 
-	for region := range targetRegions {
-		klog.Infof("  > Cleaning up LB Resources in %s...", region)
-		// FR
-		if err := m.gce.DeleteRegionForwardingRule(ctx, baseName+"-fr", region); err != nil && !gce.IsNotFoundError(err) {
-			klog.V(4).Infof("Ignored error deleting forwarding rule: %v", err)
+		for region := range targetRegions {
+			klog.Infof("  > Cleaning up LB Resources in %s...", region)
+			// FR
+			if err := m.gce.DeleteRegionForwardingRule(ctx, baseName+"-fr", region); err != nil && !gce.IsNotFoundError(err) {
+				klog.V(4).Infof("Ignored error deleting forwarding rule: %v", err)
+			}
+			// BS
+			if err := m.gce.DeleteRegionBackendService(ctx, baseName+"-bs", region); err != nil && !gce.IsNotFoundError(err) {
+				klog.V(4).Infof("Ignored error deleting backend service: %v", err)
+			}
+			// HC
+			if err := m.gce.DeleteRegionHealthCheck(ctx, baseName+"-hc", region); err != nil && !gce.IsNotFoundError(err) {
+				klog.V(4).Infof("Ignored error deleting health check: %v", err)
+			}
+			klog.Infof("    ✅ Done (Best Effort)")
 		}
-		// BS
-		if err := m.gce.DeleteRegionBackendService(ctx, baseName+"-bs", region); err != nil && !gce.IsNotFoundError(err) {
-			klog.V(4).Infof("Ignored error deleting backend service: %v", err)
-		}
-		// HC
-		if err := m.gce.DeleteRegionHealthCheck(ctx, baseName+"-hc", region); err != nil && !gce.IsNotFoundError(err) {
-			klog.V(4).Infof("Ignored error deleting health check: %v", err)
-		}
-		klog.Infof("    ✅ Done (Best Effort)")
 	}
 
 	// 2. Delete Instance Groups
-	klog.Infof("  > Cleaning up Instance Groups...")
-	filter := fmt.Sprintf("name:%s*", name)
-	groups, err := m.gce.ListInstanceGroups(ctx, filter)
-	if err != nil {
-		klog.Warningf("    ⚠️  Failed to list instance groups: %v", err)
-		errs = append(errs, fmt.Errorf("list instance groups: %w", err))
-	} else {
-		for _, g := range groups {
-			if strings.Contains(g.Name, "mig") {
-				klog.Infof("  > Deleting MIG %s in %s...", g.Name, g.Zone)
-				if err := m.gce.DeleteMIG(ctx, g.Name, g.Zone); err != nil && !gce.IsNotFoundError(err) {
-					klog.Warningf("    ⚠️  Failed: %v", err)
-					errs = append(errs, fmt.Errorf("delete MIG %s: %w", g.Name, err))
+	{
+		defer m.measure("Instance Groups Cleanup")()
+		klog.Infof("  > Cleaning up Instance Groups...")
+		filter := fmt.Sprintf("name:%s*", name)
+		groups, err := m.gce.ListInstanceGroups(ctx, filter)
+		if err != nil {
+			klog.Warningf("    ⚠️  Failed to list instance groups: %v", err)
+			errs = append(errs, fmt.Errorf("list instance groups: %w", err))
+		} else {
+			for _, g := range groups {
+				if strings.Contains(g.Name, "mig") {
+					klog.Infof("  > Deleting MIG %s in %s...", g.Name, g.Zone)
+					if err := m.gce.DeleteMIG(ctx, g.Name, g.Zone); err != nil && !gce.IsNotFoundError(err) {
+						klog.Warningf("    ⚠️  Failed: %v", err)
+						errs = append(errs, fmt.Errorf("delete MIG %s: %w", g.Name, err))
+					} else {
+						klog.Infof("    ✅ Done")
+					}
 				} else {
-					klog.Infof("    ✅ Done")
-				}
-			} else {
-				klog.Infof("  > Deleting Unmanaged IG %s in %s...", g.Name, g.Zone)
-				if err := m.gce.DeleteUnmanagedInstanceGroup(ctx, g.Name, g.Zone); err != nil && !gce.IsNotFoundError(err) {
-					klog.Warningf("    ⚠️  Failed: %v", err)
-					errs = append(errs, fmt.Errorf("delete IG %s: %w", g.Name, err))
-				} else {
-					klog.Infof("    ✅ Done")
+					klog.Infof("  > Deleting Unmanaged IG %s in %s...", g.Name, g.Zone)
+					if err := m.gce.DeleteUnmanagedInstanceGroup(ctx, g.Name, g.Zone); err != nil && !gce.IsNotFoundError(err) {
+						klog.Warningf("    ⚠️  Failed: %v", err)
+						errs = append(errs, fmt.Errorf("delete IG %s: %w", g.Name, err))
+					} else {
+						klog.Infof("    ✅ Done")
+					}
 				}
 			}
 		}
 	}
 
 	// 3. Delete Remaining Instances
-	if len(instances) > 0 {
-		for _, inst := range instances {
-			klog.Infof("  > Deleting Instance %s in %s...", inst.Name, inst.Zone)
-			if _, err := m.gce.Run(ctx, "compute", "instances", "delete", inst.Name, "--zone", inst.Zone, "--quiet"); err != nil && !gce.IsNotFoundError(err) {
+	{
+		defer m.measure("Instances Cleanup")()
+		if len(instances) > 0 {
+			for _, inst := range instances {
+				klog.Infof("  > Deleting Instance %s in %s...", inst.Name, inst.Zone)
+				if _, err := m.gce.Run(ctx, "compute", "instances", "delete", inst.Name, "--zone", inst.Zone, "--quiet"); err != nil && !gce.IsNotFoundError(err) {
+					klog.Warningf("    ⚠️  Failed: %v", err)
+					errs = append(errs, fmt.Errorf("delete instance %s: %w", inst.Name, err))
+				} else {
+					klog.Infof("    ✅ Done")
+				}
+			}
+		}
+	}
+
+	// 4. Delete Addresses
+	{
+		defer m.measure("Address Cleanup")()
+		for _, addr := range addresses {
+			klog.Infof("  > Deleting Address %s...", addr.Name)
+			if err := m.gce.DeleteAddress(ctx, addr.Name, addr.Region); err != nil && !gce.IsNotFoundError(err) {
 				klog.Warningf("    ⚠️  Failed: %v", err)
-				errs = append(errs, fmt.Errorf("delete instance %s: %w", inst.Name, err))
+				errs = append(errs, fmt.Errorf("delete address %s: %w", addr.Name, err))
 			} else {
 				klog.Infof("    ✅ Done")
 			}
 		}
 	}
 
-	// 4. Delete Addresses
-	for _, addr := range addresses {
-		klog.Infof("  > Deleting Address %s...", addr.Name)
-		if err := m.gce.DeleteAddress(ctx, addr.Name, addr.Region); err != nil && !gce.IsNotFoundError(err) {
+	// 5. Delete Firewall Rules
+	// Check if rules exist by trying to delete them and ignoring NotFound
+	{
+		defer m.measure("Firewall Rules Cleanup")()
+		klog.Infof("  > Deleting Firewall Rules...")
+		rules := []string{name + "-internal", name + "-external"}
+		fwArgs := append([]string{"compute", "firewall-rules", "delete"}, rules...)
+		fwArgs = append(fwArgs, "--quiet")
+		if _, err := m.gce.Run(ctx, fwArgs...); err != nil && !gce.IsNotFoundError(err) {
 			klog.Warningf("    ⚠️  Failed: %v", err)
-			errs = append(errs, fmt.Errorf("delete address %s: %w", addr.Name, err))
+			errs = append(errs, fmt.Errorf("delete firewall rules: %w", err))
 		} else {
 			klog.Infof("    ✅ Done")
 		}
-	}
-
-	// 5. Delete Firewall Rules
-	// Check if rules exist by trying to delete them and ignoring NotFound
-	klog.Infof("  > Deleting Firewall Rules...")
-	rules := []string{name + "-internal", name + "-external"}
-	fwArgs := append([]string{"compute", "firewall-rules", "delete"}, rules...)
-	fwArgs = append(fwArgs, "--quiet")
-	if _, err := m.gce.Run(ctx, fwArgs...); err != nil && !gce.IsNotFoundError(err) {
-		klog.Warningf("    ⚠️  Failed: %v", err)
-		errs = append(errs, fmt.Errorf("delete firewall rules: %w", err))
-	} else {
-		klog.Infof("    ✅ Done")
 	}
 
 	if len(errs) > 0 {
