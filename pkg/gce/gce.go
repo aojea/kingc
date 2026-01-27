@@ -330,14 +330,14 @@ func (c *Client) SSH(ctx context.Context, instance, zone string, cmd []string) e
 
 func (c *Client) RunSSHOutput(ctx context.Context, instance, zone, command string) (string, error) {
 	// Attempt 1
-	out, err := c.Run(ctx, "compute", "ssh", instance, "--zone", zone, "--command", command, "--", "-q")
+	out, err := c.RunQuiet(ctx, "compute", "ssh", instance, "--zone", zone, "--command", command, "--", "-q")
 	if err == nil {
 		return out, nil
 	}
 
 	// Attempt 2
 	klog.V(2).Infof("RunSSHOutput attempt 1 to %s failed (%v), retrying with -F /dev/null", instance, err)
-	out2, err2 := c.Run(ctx, "compute", "ssh", instance, "--zone", zone, "--ssh-flag=-F /dev/null", "--command", command, "--", "-q")
+	out2, err2 := c.RunQuiet(ctx, "compute", "ssh", instance, "--zone", zone, "--ssh-flag=-F /dev/null", "--command", command, "--", "-q")
 	if err2 == nil {
 		klog.Warningf("SSH command to %s succeeded only after bypassing local SSH config (-F /dev/null).", instance)
 		return out2, nil

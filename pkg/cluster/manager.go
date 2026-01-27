@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"text/template"
 	"time"
@@ -63,6 +64,20 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 			if cleanupErr := m.Delete(context.Background(), cfg.Metadata.Name); cleanupErr != nil {
 				klog.Errorf("⚠️  Failed to cleanup resources: %v", cleanupErr)
 			}
+		}
+	}()
+
+	// Create a temporary directory for all intermediate files
+	tmpDir, err := os.MkdirTemp("", "kingc-install-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp dir: %v", err)
+	}
+	// Cleanup temp dir unless retained (useful for debugging generated scripts)
+	defer func() {
+		if !retain {
+			os.RemoveAll(tmpDir)
+		} else {
+			klog.Infof("⚠️  Retaining temporary files in %s", tmpDir)
 		}
 	}()
 
@@ -178,11 +193,10 @@ kubeadm init --config /etc/kubernetes/kubeadm-config.yaml --upload-certs --ignor
 echo "👑 kingc: Control Plane Initialized"
 `, baseInstallScript, kubeadmConfig)
 
-	tmpCPStartup, _ := os.CreateTemp("", "cp-startup-*.sh")
-	if err := os.WriteFile(tmpCPStartup.Name(), []byte(cpStartupScript), 0644); err != nil {
+	tmpCPStartup := filepath.Join(tmpDir, "cp-startup.sh")
+	if err := os.WriteFile(tmpCPStartup, []byte(cpStartupScript), 0644); err != nil {
 		return fmt.Errorf("failed to write startup script: %v", err)
 	}
-	defer func() { _ = os.Remove(tmpCPStartup.Name()) }()
 
 	// 5. Provision Control Plane
 	var cpName, cpZone, cpNet, cpSub string
@@ -207,7 +221,7 @@ echo "👑 kingc: Control Plane Initialized"
 			ctx,
 			cpName, cpZone, cfg.Spec.ControlPlane.MachineType,
 			cpNet, cpSub,
-			config.DefaultImageFamily, "", tmpCPStartup.Name(),
+			config.DefaultImageFamily, "", tmpCPStartup,
 			"",
 			[]string{
 				basename(cfg.Metadata.Name),
@@ -277,12 +291,12 @@ echo "👑 kingc: Control Plane Initialized"
 			return fmt.Errorf("failed to fetch kubeconfig: %v", err)
 		}
 
-		localKubeconfig = fmt.Sprintf("%s.conf", cfg.Metadata.Name)
+		localKubeconfig = filepath.Join(tmpDir, "admin.conf")
 		if err := os.WriteFile(localKubeconfig, []byte(kc), 0600); err != nil {
 			return fmt.Errorf("failed to write kubeconfig to %s: %v", localKubeconfig, err)
 		}
 
-		klog.Infof("✅ Cluster ready! Kubeconfig at: ./%s", localKubeconfig)
+		klog.Infof("    ✅ Kubeconfig fetched (internal)")
 	}
 
 	// 8. Install Addons (CNI, CCM)
@@ -299,19 +313,13 @@ echo "👑 kingc: Control Plane Initialized"
 
 			klog.Infof("    - Installing kindnet (v%s)...", "1.0.0") // Hardcoded for now or use variable
 
-			tmpKindnet, err := os.CreateTemp("", "kindnet-*.yaml")
+			tmpKindnet := filepath.Join(tmpDir, "kindnet.yaml")
+			err = os.WriteFile(tmpKindnet, []byte(kindnetManifest), 0644)
 			if err != nil {
-				return fmt.Errorf("failed to create temp file: %v", err)
+				return fmt.Errorf("failed to write kindnet manifest to %s: %v", tmpKindnet, err)
 			}
-			err = os.WriteFile(tmpKindnet.Name(), []byte(kindnetManifest), 0644)
-			if err != nil {
-				return fmt.Errorf("failed to write kindnet manifest to %s: %v", tmpKindnet.Name(), err)
-			}
-			defer func() {
-				_ = os.Remove(tmpKindnet.Name())
-			}()
 
-			cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", localKubeconfig, "apply", "-f", tmpKindnet.Name())
+			cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", localKubeconfig, "apply", "-f", tmpKindnet)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("failed to apply kindnet manifest: %v, output: %s", err, out)
 			}
@@ -328,14 +336,10 @@ echo "👑 kingc: Control Plane Initialized"
 
 			klog.Infof("    - Installing Cloud Provider GCP...")
 
-			tmpCCM, err := os.CreateTemp("", "ccm-*.yaml")
-			if err != nil {
-				return fmt.Errorf("failed to create temp file: %v", err)
-			}
-			os.WriteFile(tmpCCM.Name(), []byte(ccmManifest), 0644)
-			defer os.Remove(tmpCCM.Name())
+			tmpCCM := filepath.Join(tmpDir, "ccm.yaml")
+			os.WriteFile(tmpCCM, []byte(ccmManifest), 0644)
 
-			cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", localKubeconfig, "apply", "-f", tmpCCM.Name())
+			cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", localKubeconfig, "apply", "-f", tmpCCM)
 			if out, err := cmd.CombinedOutput(); err != nil {
 				klog.Warningf("    ⚠️  Failed to install CCM: %v\nOutput: %s", err, out)
 			}
@@ -362,14 +366,10 @@ echo "👑 kingc: Joining cluster..."
 %s --ignore-preflight-errors=NumCPU
 `, baseInstallScript, joinCommand)
 
-		tmpWorkerStartup, err := os.CreateTemp("", "worker-startup-*.sh")
-		if err != nil {
-			return fmt.Errorf("failed to create worker startup script: %v", err)
-		}
-		if err := os.WriteFile(tmpWorkerStartup.Name(), []byte(workerStartup), 0644); err != nil {
+		tmpWorkerStartup := filepath.Join(tmpDir, "worker-startup.sh")
+		if err := os.WriteFile(tmpWorkerStartup, []byte(workerStartup), 0644); err != nil {
 			return fmt.Errorf("failed to write worker startup script: %v", err)
 		}
-		defer func() { _ = os.Remove(tmpWorkerStartup.Name()) }()
 
 		for _, grp := range cfg.Spec.WorkerGroups {
 			klog.Infof("    [%s] Creating Instance Template and MIG (%d replicas) in %s...", grp.Name, grp.Replicas, grp.Zone)
@@ -396,7 +396,7 @@ echo "👑 kingc: Joining cluster..."
 			if err := m.gce.CreateInstanceTemplate(
 				ctx,
 				tmplName, grp.MachineType, networks, subnets,
-				config.DefaultImageFamily, tmpWorkerStartup.Name(),
+				config.DefaultImageFamily, tmpWorkerStartup,
 				[]string{
 					basename(cfg.Metadata.Name),
 					"kingc-role-worker",
@@ -411,6 +411,20 @@ echo "👑 kingc: Joining cluster..."
 				return err
 			}
 		}
+	}
+
+	// 10. Finalize (Export Kubeconfig)
+	finalKubeconfig := fmt.Sprintf("%s.conf", cfg.Metadata.Name)
+	// Read from temp and write to CWD
+	kcBytes, err := os.ReadFile(localKubeconfig)
+	if err == nil {
+		if err := os.WriteFile(finalKubeconfig, kcBytes, 0600); err != nil {
+			klog.Warningf("⚠️  Failed to write final kubeconfig to ./%s: %v", finalKubeconfig, err)
+		} else {
+			klog.Infof("✅ Cluster ready! Kubeconfig available at: ./%s", finalKubeconfig)
+		}
+	} else {
+		klog.Warningf("⚠️  Could not read temporary kubeconfig to export: %v", err)
 	}
 
 	return nil
