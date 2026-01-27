@@ -102,12 +102,6 @@ func (c *Client) RunQuiet(ctx context.Context, args ...string) (string, error) {
 	// So we must separate them.
 	if c.Verbosity != "" && c.Verbosity != "none" {
 		cmd.Stderr = os.Stderr
-	} else {
-		// Discard stderr by default or if quiet?
-		// RunQuiet implies we don't want noise.
-		// But if error happens, we want to know why.
-		// The original implementation just discarded stderr via cmd.Output() (which captures stdout only).
-		// We'll mimic that unless verbosity is explicitly enabled.
 	}
 
 	err := cmd.Run()
