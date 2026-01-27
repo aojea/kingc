@@ -13,9 +13,10 @@ import (
 )
 
 type Client struct {
-	Verbosity    string
-	Quiet        bool
-	NoUserOutput bool
+	Verbosity     string
+	Quiet         bool
+	NoUserOutput  bool
+	Configuration string
 }
 
 type ClientOption func(*Client)
@@ -38,6 +39,12 @@ func WithNoUserOutput(n bool) ClientOption {
 	}
 }
 
+func WithConfiguration(cfg string) ClientOption {
+	return func(c *Client) {
+		c.Configuration = cfg
+	}
+}
+
 func NewClient(opts ...ClientOption) *Client {
 	c := &Client{}
 	for _, opt := range opts {
@@ -47,6 +54,12 @@ func NewClient(opts ...ClientOption) *Client {
 }
 
 func (c *Client) argsWithVerbosity(args []string) []string {
+	// Prepend configuration so it applies globally
+	var prefix []string
+	if c.Configuration != "" {
+		prefix = append(prefix, "--configuration", c.Configuration)
+	}
+	// Append verbosity flags
 	if c.Verbosity != "" {
 		args = append(args, "--verbosity", c.Verbosity)
 	}
@@ -56,19 +69,13 @@ func (c *Client) argsWithVerbosity(args []string) []string {
 	if c.NoUserOutput {
 		args = append(args, "--no-user-output-enabled")
 	}
-	return args
+	return append(prefix, args...)
 }
 
 func (c *Client) Run(ctx context.Context, args ...string) (string, error) {
 	args = c.argsWithVerbosity(args)
 	cmd := exec.CommandContext(ctx, "gcloud", args...)
 	cmd.Env = os.Environ()
-	// If verbosity is set, we might want to see stderr even if we capture output?
-	// CombinedOutput captures both.
-	// If NoUserOutput is set, standard output/error are suppressed by gcloud itself,
-	// but we still might get something specific if we ask?
-	// Actually --no-user-output-enabled suppresses printing to terminal, but we are capturing it.
-	// Let's stick to standard behavior: Run returns CombinedOutput.
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("command failed: gcloud %s: %v\nOutput: %s", strings.Join(args, " "), err, string(out))

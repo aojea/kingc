@@ -97,6 +97,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolP("quiet", "q", false, "silence all stderr output")
 	rootCmd.PersistentFlags().VarP(&verbosityFlag, "verbosity", "v", "gcloud verbosity level (debug, info, warning, error, critical, none)")
 	rootCmd.PersistentFlags().Bool("no-user-output-enabled", false, "suppress command output to standard output and standard error (gcloud)")
+	rootCmd.PersistentFlags().String("gcloud-configuration", "", "gcloud configuration profile to use")
 
 	rootCmd.PersistentPreRun = func(cmd *cobra.Command, args []string) {
 		quiet, _ := cmd.Flags().GetBool("quiet")
@@ -245,11 +246,13 @@ func main() {
 func getClient(cmd *cobra.Command) *gce.Client {
 	quiet, _ := cmd.Flags().GetBool("quiet")
 	noUserOutput, _ := cmd.Flags().GetBool("no-user-output-enabled")
+	configuration, _ := cmd.Flags().GetString("gcloud-configuration")
 
 	return gce.NewClient(
 		gce.WithVerbosity(verbosityFlag.String()),
 		gce.WithQuiet(quiet),
 		gce.WithNoUserOutput(noUserOutput),
+		gce.WithConfiguration(configuration),
 	)
 }
 
