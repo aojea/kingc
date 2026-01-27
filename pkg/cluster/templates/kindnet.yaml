@@ -20,7 +20,7 @@ rules:
     verbs:
       - get
   - apiGroups:
-     - ""
+      - ""
     resources:
       - configmaps
     verbs:
@@ -34,7 +34,7 @@ rules:
       - list
       - watch
   - apiGroups:
-     - "networking.k8s.io"
+      - "networking.k8s.io"
     resources:
       - networkpolicies
     verbs:
@@ -86,9 +86,9 @@ spec:
         effect: NoSchedule
       serviceAccountName: kindnet
       initContainers:
-       - name: install-cni-bin
-         image: {{ .KindnetImage }}
-         command: ['sh', '-c', 'cat /opt/cni/bin/cni-kindnet > /cni/cni-kindnet ; chmod +x /cni/cni-kindnet']
+      - name: install-cni-bin
+        image: {{ .KindnetImage }}
+        command: ['sh', '-c', 'cat /opt/cni/bin/cni-kindnet > /cni/cni-kindnet ; chmod +x /cni/cni-kindnet']
         volumeMounts:
         - name: cni-bin
           mountPath: /cni
@@ -154,4 +154,3 @@ spec:
       - name: netns
         hostPath:
           path: /var/run/netns
----
