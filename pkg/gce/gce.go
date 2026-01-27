@@ -59,15 +59,15 @@ func (c *Client) argsWithVerbosity(args []string) []string {
 	if c.Configuration != "" {
 		prefix = append(prefix, "--configuration", c.Configuration)
 	}
-	// Append verbosity flags
+	// Prepend verbosity flags (global flags should come before command args)
 	if c.Verbosity != "" {
-		args = append(args, "--verbosity", c.Verbosity)
+		prefix = append(prefix, "--verbosity", c.Verbosity)
 	}
 	if c.Quiet {
-		args = append(args, "--quiet")
+		prefix = append(prefix, "--quiet")
 	}
 	if c.NoUserOutput {
-		args = append(args, "--no-user-output-enabled")
+		prefix = append(prefix, "--no-user-output-enabled")
 	}
 	return append(prefix, args...)
 }
