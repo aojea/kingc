@@ -19,6 +19,8 @@ const (
 	DefaultNetworkName = "kingc-net"
 	DefaultSubnetName  = "kingc-subnet"
 	DefaultSubnetCIDR  = "10.0.0.0/24"
+	DefaultPodCIDR     = "10.244.0.0/16"
+	DefaultServiceCIDR = "10.96.0.0/12"
 
 	DefaultControlPlaneName = "control-plane"
 	DefaultWorkerGroupName  = "workers"
@@ -65,6 +67,14 @@ func (c *Cluster) SetDefaults() {
 	// Worker Groups Defaults
 	for i := range c.Spec.WorkerGroups {
 		c.applyNodeGroupDefaults(&c.Spec.WorkerGroups[i])
+	}
+
+	// Kubernetes Defaults
+	if c.Spec.Kubernetes.Networking.PodCIDR == "" {
+		c.Spec.Kubernetes.Networking.PodCIDR = DefaultPodCIDR
+	}
+	if c.Spec.Kubernetes.Networking.ServiceCIDR == "" {
+		c.Spec.Kubernetes.Networking.ServiceCIDR = DefaultServiceCIDR
 	}
 }
 

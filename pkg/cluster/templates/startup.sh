@@ -1,3 +1,10 @@
+#! /bin/bash
+set -euo pipefail
+
+# Enable IP forwarding (Kubernetes Requirement)
+modprobe -v br_netfilter
+sysctl -w net.ipv4.ip_forward=1
+echo "net.ipv4.ip_forward=1" | tee -a /etc/sysctl.conf
 
 sysctl --system
 
@@ -40,6 +47,3 @@ echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.
 apt-get update
 apt-get install -y kubelet kubeadm kubectl
 apt-mark hold kubelet kubeadm kubectl
-
-# Install Cloud Provider Utils
-apt-get install -y jq socat

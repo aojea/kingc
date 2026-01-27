@@ -22,7 +22,9 @@ type Spec struct {
 	Region string `yaml:"region"`
 
 	// KubernetesVersion allows pinning a specific version (e.g. "v1.30.0")
-	KubernetesVersion string `yaml:"kubernetesVersion"`
+	// It is now nested in Kubernetes.Version
+
+	Kubernetes Kubernetes `yaml:"kubernetes"`
 
 	FeatureGates  map[string]bool   `yaml:"featureGates"`
 	RuntimeConfig map[string]string `yaml:"runtimeConfig"`
@@ -33,6 +35,17 @@ type Spec struct {
 	WorkerGroups []NodeGroup `yaml:"workerGroups"`
 
 	KubeadmConfigPatches []string `yaml:"kubeadmConfigPatches"`
+}
+
+type Kubernetes struct {
+	Version    string               `yaml:"version"`
+	Networking KubernetesNetworking `yaml:"networking"`
+}
+
+type KubernetesNetworking struct {
+	PodCIDR           string `yaml:"podCIDR"`
+	ServiceCIDR       string `yaml:"serviceCIDR"`
+	DisableDefaultCNI bool   `yaml:"disableDefaultCNI"`
 }
 
 type NetworkSpec struct {
@@ -81,7 +94,7 @@ func Default() *Cluster {
 	}
 	c.Metadata.Name = DefaultClusterName
 	c.Spec.Region = DefaultRegion
-	c.Spec.KubernetesVersion = DefaultKubernetesVersion
+	c.Spec.Kubernetes.Version = DefaultKubernetesVersion
 
 	c.Spec.ControlPlane = NodeGroup{
 		Name:        DefaultControlPlaneName,
