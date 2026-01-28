@@ -1022,6 +1022,7 @@ func (m *Manager) signKubeconfig(ctx context.Context, cfg *config.Cluster, cn st
 	return config.GenerateKubeconfig(
 		cfg.Metadata.Name,
 		cfg.Spec.ExternalAPIServer.String(),
+		cn,
 		caCert,
 		certPEM,
 		keyPEM,
