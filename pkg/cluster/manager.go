@@ -371,56 +371,31 @@ echo "👑 kingc: Control Plane Initialized"
 		}
 
 	}
-	// Install Addons (CNI, CCM)
+	// Install Cloud Controller Manager
 	{
-		defer m.measure("Install Addons")()
-		klog.Infof("  > Installing Addons...")
+		defer m.measure("Install CCM")()
+		klog.Infof("  > Installing CCM...")
 
-		// A. CNI (kindnet)
-		if !cfg.Spec.Kubernetes.Networking.DisableDefaultCNI {
-			kindnetManifest, err := m.renderTemplate("templates/kindnet.yaml", templateData)
-			if err != nil {
-				return err
-			}
-
-			klog.Infof("    - Installing kindnet (v%s)...", "1.0.0") // Hardcoded for now or use variable
-
-			tmpKindnet := filepath.Join(tmpDir, "kindnet.yaml")
-			err = os.WriteFile(tmpKindnet, []byte(kindnetManifest), 0644)
-			if err != nil {
-				return fmt.Errorf("failed to write kindnet manifest to %s: %v", tmpKindnet, err)
-			}
-
-			cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", localKubeconfig, "apply", "-f", tmpKindnet)
-			if out, err := cmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("failed to apply kindnet manifest: %v, output: %s", err, out)
-			}
-		} else {
-			klog.Infof("    - Skipping default CNI (disabled in config)")
+		ccmManifest, err := m.renderTemplate("templates/ccm.yaml", templateData)
+		if err != nil {
+			return err
 		}
 
-		// B. Cloud Controller Manager (external)
-		{
-			ccmManifest, err := m.renderTemplate("templates/ccm.yaml", templateData)
-			if err != nil {
-				return err
-			}
+		klog.Infof("    - Installing Cloud Provider GCP...")
 
-			klog.Infof("    - Installing Cloud Provider GCP...")
-
-			tmpCCM := filepath.Join(tmpDir, "ccm.yaml")
-			if err := os.WriteFile(tmpCCM, []byte(ccmManifest), 0644); err != nil {
-				return err
-			}
-
-			cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", localKubeconfig, "apply", "-f", tmpCCM)
-			if out, err := cmd.CombinedOutput(); err != nil {
-				klog.Warningf("    ⚠️  Failed to install CCM: %v\nOutput: %s", err, out)
-			}
+		tmpCCM := filepath.Join(tmpDir, "ccm.yaml")
+		if err := os.WriteFile(tmpCCM, []byte(ccmManifest), 0644); err != nil {
+			return err
 		}
+
+		cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", localKubeconfig, "apply", "-f", tmpCCM)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			klog.Warningf("    ⚠️  Failed to install CCM: %v\nOutput: %s", err, out)
+		}
+
 	}
 
-	// 9. Worker Pools
+	// Worker Pools
 	{
 		defer m.measure("Worker Groups Provisioning")()
 		klog.Infof("  > Provisioning Worker Groups...")
@@ -486,9 +461,35 @@ echo "👑 kingc: Joining cluster..."
 			}
 		}
 	}
+	// CNI and other addons
+	{
+		defer m.measure("Install CNI")()
+		klog.Infof("  > Installing CNI...")
+		//  CNI (kindnet)
+		if !cfg.Spec.Kubernetes.Networking.DisableDefaultCNI {
+			kindnetManifest, err := m.renderTemplate("templates/kindnet.yaml", templateData)
+			if err != nil {
+				return err
+			}
 
-	// 10. Finalize (Merge Kubeconfig)
-	// Read from temp and merge into KUBECONFIG
+			klog.Infof("    - Installing kindnet (v%s)...", "1.0.0") // Hardcoded for now or use variable
+
+			tmpKindnet := filepath.Join(tmpDir, "kindnet.yaml")
+			err = os.WriteFile(tmpKindnet, []byte(kindnetManifest), 0644)
+			if err != nil {
+				return fmt.Errorf("failed to write kindnet manifest to %s: %v", tmpKindnet, err)
+			}
+
+			cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", localKubeconfig, "apply", "-f", tmpKindnet)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("failed to apply kindnet manifest: %v, output: %s", err, out)
+			}
+		} else {
+			klog.Infof("    - Skipping default CNI (disabled in config)")
+		}
+	}
+
+	// Finalize (Merge Kubeconfig)
 	kcBytes, err := os.ReadFile(localKubeconfig)
 	if err == nil {
 		if err := mergeKubeconfig(cfg.Metadata.Name, kcBytes); err != nil {
