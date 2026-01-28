@@ -40,10 +40,11 @@ type Manager struct {
 }
 
 type ExternalAPIServerResult struct {
-	Endpoint string
-	CACert   []byte
-	SAKey    []byte
-	SAPub    []byte
+	Endpoint   string
+	CACert     []byte
+	SAKey      []byte
+	SAPub      []byte
+	Kubeconfig string
 }
 
 func NewManager(client *gce.Client) *Manager {
@@ -145,6 +146,8 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 	// 1.5 Ensure External APIServer (New Architecture)
 	var caCert, saKey, saPub []byte
 	var localKubeconfig string
+	var adminKubeconfig, schedulerKubeconfig, cmKubeconfig, kubeletKubeconfig string
+
 	{
 		defer m.measure("Ensure External APIServer")()
 
@@ -184,53 +187,37 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 
 		// Generate Admin Kubeconfig locally
 		{
-			klog.Infof("  > Generating local admin kubeconfig...")
-			// Generate Admin Key
-			adminKey, err := rsa.GenerateKey(rand.Reader, 2048)
+			klog.Infof("  > Generating local kubeconfigs...")
+
+			// 1. Admin
+			adminKubeconfig, err = m.signKubeconfig(ctx, cfg, "kubernetes-admin", []string{"system:masters"}, res.CACert)
 			if err != nil {
-				return fmt.Errorf("failed to generate admin key: %v", err)
+				return fmt.Errorf("signing admin kubeconfig: %v", err)
 			}
-			adminKeyBytes := x509.MarshalPKCS1PrivateKey(adminKey)
-			adminKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: adminKeyBytes})
-
-			// Create CSR for system:masters
-			subj := pkix.Name{
-				CommonName:   "kubernetes-admin",
-				Organization: []string{"system:masters"},
-			}
-			template := x509.CertificateRequest{
-				Subject: subj,
-			}
-			csrBytes, err := x509.CreateCertificateRequest(rand.Reader, &template, adminKey)
-			if err != nil {
-				return fmt.Errorf("failed to create admin CSR: %v", err)
-			}
-			csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrBytes})
-
-			// Sign with CAS
-			poolID := fmt.Sprintf("kingc-pool-%s", cfg.Metadata.Name)
-			caID := fmt.Sprintf("kingc-ca-%s", cfg.Metadata.Name)
-			casRegion := cfg.Spec.Region
-
-			adminCertPEM, err := m.gce.SignCASCertificate(ctx, csrPEM, poolID, casRegion, caID)
-			if err != nil {
-				return fmt.Errorf("failed to sign admin certificate: %v", err)
-			}
-
-			// Generate Kubeconfig
-			kc := config.GenerateKubeconfig(
-				cfg.Metadata.Name,
-				cfg.Spec.ExternalAPIServer.String(),
-				res.CACert,
-				adminCertPEM,
-				adminKeyPEM,
-			)
-
 			localKubeconfig = filepath.Join(tmpDir, "admin.conf")
-			if err := os.WriteFile(localKubeconfig, []byte(kc), 0600); err != nil {
+			if err := os.WriteFile(localKubeconfig, []byte(adminKubeconfig), 0600); err != nil {
 				return fmt.Errorf("failed to write kubeconfig to %s: %v", localKubeconfig, err)
 			}
-			klog.Infof("    ✅ Kubeconfig generated locally at %s", localKubeconfig)
+			klog.Infof("    ✅ Admin Kubeconfig generated locally at %s", localKubeconfig)
+
+			// 2. Scheduler
+			schedulerKubeconfig, err = m.signKubeconfig(ctx, cfg, "system:kube-scheduler", []string{"system:kube-scheduler"}, res.CACert)
+			if err != nil {
+				return fmt.Errorf("signing scheduler kubeconfig: %v", err)
+			}
+
+			// 3. Controller Manager
+			cmKubeconfig, err = m.signKubeconfig(ctx, cfg, "system:kube-controller-manager", []string{"system:kube-controller-manager"}, res.CACert)
+			if err != nil {
+				return fmt.Errorf("signing controller-manager kubeconfig: %v", err)
+			}
+
+			// 4. Kubelet (for the first CP node)
+			cpName := fmt.Sprintf("%s-cp", basename(cfg.Metadata.Name))
+			kubeletKubeconfig, err = m.signKubeconfig(ctx, cfg, fmt.Sprintf("system:node:%s", cpName), []string{"system:nodes"}, res.CACert)
+			if err != nil {
+				return fmt.Errorf("signing kubelet kubeconfig: %v", err)
+			}
 		}
 
 		// Store PKI data for Control Plane provisioning
@@ -273,17 +260,21 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 	}
 
 	templateData := map[string]interface{}{
-		"ClusterName":           cfg.Metadata.Name,
-		"ControlPlaneEndpoint":  cfg.Spec.ExternalAPIServer.Host,
-		"ControlPlaneIP":        cfg.Spec.ExternalAPIServer.Hostname(),
-		"KubernetesVersion":     cfg.Spec.Kubernetes.Version,
-		"KubernetesRepoVersion": repoVer,
-		"PodSubnet":             cfg.Spec.Kubernetes.Networking.PodCIDR,
-		"ServiceSubnet":         cfg.Spec.Kubernetes.Networking.ServiceCIDR,
-		"KindnetImage":          "registry.k8s.io/networking/kindnet:v1.0.0",
-		"CCMImage":              "registry.k8s.io/cloud-provider-gcp/cloud-controller-manager:v35.0.0",
-		"FeatureGates":          cfg.Spec.FeatureGates,
-		"RuntimeConfig":         rcBuilder.String(),
+		"ClusterName":                 cfg.Metadata.Name,
+		"ControlPlaneEndpoint":        cfg.Spec.ExternalAPIServer.Host,
+		"ControlPlaneIP":              cfg.Spec.ExternalAPIServer.Hostname(),
+		"KubernetesVersion":           cfg.Spec.Kubernetes.Version,
+		"KubernetesRepoVersion":       repoVer,
+		"PodSubnet":                   cfg.Spec.Kubernetes.Networking.PodCIDR,
+		"ServiceSubnet":               cfg.Spec.Kubernetes.Networking.ServiceCIDR,
+		"KindnetImage":                "registry.k8s.io/networking/kindnet:v1.0.0",
+		"CCMImage":                    "registry.k8s.io/cloud-provider-gcp/cloud-controller-manager:v35.0.0",
+		"FeatureGates":                cfg.Spec.FeatureGates,
+		"RuntimeConfig":               rcBuilder.String(),
+		"Kubeconfig":                  adminKubeconfig,
+		"SchedulerKubeconfig":         schedulerKubeconfig,
+		"ControllerManagerKubeconfig": cmKubeconfig,
+		"KubeletKubeconfig":           kubeletKubeconfig,
 	}
 
 	// Render the base installation script
@@ -307,7 +298,8 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 
 	// Construct the CP startup script
 	// apiserver and etcd are already running in the external apiserver
-	kubeadmArgs := "--upload-certs --ignore-preflight-errors=NumCPU --skip-phases=etcd,control-plane/apiserver,certs/apiserver,certs/apiserver-kubelet-client,certs/front-proxy-client,certs/etcd-healthcheck-client,certs/apiserver-etcd-client"
+	// We skip certs phases (external CA/SA) and kubeconfig phases (we provide them)
+	kubeadmArgs := "--ignore-preflight-errors=NumCPU --skip-phases=etcd,control-plane/apiserver,certs/apiserver,certs/apiserver-kubelet-client,certs/front-proxy-client,certs/etcd-healthcheck-client,certs/apiserver-etcd-client,kubeconfig/all"
 
 	cpStartupScript := fmt.Sprintf(`%s
 
@@ -320,6 +312,12 @@ echo "%s" > /etc/kubernetes/pki/ca.crt
 echo "%s" > /etc/kubernetes/pki/sa.key
 echo "%s" > /etc/kubernetes/pki/sa.pub
 
+echo "👑 kingc: Writing Kubeconfigs..."
+echo "%s" > /etc/kubernetes/admin.conf
+echo "%s" > /etc/kubernetes/scheduler.conf
+echo "%s" > /etc/kubernetes/controller-manager.conf
+echo "%s" > /etc/kubernetes/kubelet.conf
+
 echo "👑 kingc: Writing kubeadm config..."
 mkdir -p /etc/kubernetes
 cat <<EOF > /etc/kubernetes/kubeadm-config.yaml
@@ -331,7 +329,7 @@ kubeadm init --config /etc/kubernetes/kubeadm-config.yaml %s
 
 echo "👑 kingc: Control Plane Initialized"
 echo "👑 kingc: Control Plane Initialized"
-`, baseInstallScript, string(caCert), string(saKey), string(saPub), kubeadmConfig, kubeadmArgs)
+`, baseInstallScript, string(caCert), string(saKey), string(saPub), templateData["Kubeconfig"], templateData["SchedulerKubeconfig"], templateData["ControllerManagerKubeconfig"], templateData["KubeletKubeconfig"], kubeadmConfig, kubeadmArgs)
 
 	tmpCPStartup := filepath.Join(tmpDir, "cp-startup.sh")
 	if err := os.WriteFile(tmpCPStartup, []byte(cpStartupScript), 0644); err != nil {
@@ -949,6 +947,7 @@ echo "%s" > /var/lib/kingc/pki/sa.pub
 		"--tls-cert-file=/var/run/kubernetes/apiserver.crt",
 		"--tls-private-key-file=/var/run/kubernetes/apiserver.key",
 		"--client-ca-file=/var/run/kubernetes/ca.crt",
+		"--allow-privileged=true",
 	}
 
 	meta := map[string]string{
@@ -984,6 +983,49 @@ echo "%s" > /var/lib/kingc/pki/sa.pub
 		SAKey:    saKeyPEM,
 		SAPub:    saPubPEM,
 	}, nil
+}
+
+func (m *Manager) signKubeconfig(ctx context.Context, cfg *config.Cluster, cn string, orgs []string, caCert []byte) (string, error) {
+	// Generate Key
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return "", fmt.Errorf("generate key: %v", err)
+	}
+	keyBytes := x509.MarshalPKCS1PrivateKey(key)
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: keyBytes})
+
+	// CSR
+	subj := pkix.Name{
+		CommonName:   cn,
+		Organization: orgs,
+	}
+	template := x509.CertificateRequest{
+		Subject: subj,
+	}
+	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, &template, key)
+	if err != nil {
+		return "", fmt.Errorf("create csr: %v", err)
+	}
+	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrBytes})
+
+	// Sign with CAS
+	poolID := fmt.Sprintf("kingc-pool-%s", cfg.Metadata.Name)
+	caID := fmt.Sprintf("kingc-ca-%s", cfg.Metadata.Name)
+	casRegion := cfg.Spec.Region
+
+	certPEM, err := m.gce.SignCASCertificate(ctx, csrPEM, poolID, casRegion, caID)
+	if err != nil {
+		return "", fmt.Errorf("sign certificate: %v", err)
+	}
+
+	// Generate Kubeconfig
+	return config.GenerateKubeconfig(
+		cfg.Metadata.Name,
+		cfg.Spec.ExternalAPIServer.String(),
+		caCert,
+		certPEM,
+		keyPEM,
+	), nil
 }
 
 func (m *Manager) generateJoinCommand(ctx context.Context, kubeconfigPath, controlPlaneEndpoint string, caCert []byte) (string, error) {
