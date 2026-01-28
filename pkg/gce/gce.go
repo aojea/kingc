@@ -353,16 +353,15 @@ func (c *Client) SignCASCertificate(ctx context.Context, csrPEM []byte, pool, lo
 	certID := fmt.Sprintf("kingc-cert-%d", time.Now().UnixNano())
 	args := []string{
 		"privateca", "certificates", "create", certID,
-		"--csr-file", tmpCsr.Name(),
+		"--csr", tmpCsr.Name(),
 		"--cert-output-file", tmpCert.Name(),
 		"--issuer-pool", pool,
 		"--issuer-location", location,
-		"--generate-request-id",
 		"--validity", "P1Y",
 		"--quiet",
 	}
 	if caName != "" {
-		args = append(args, "--issuer-ca", caName)
+		args = append(args, "--ca", caName)
 	}
 
 	if _, err := c.Run(ctx, args...); err != nil {
