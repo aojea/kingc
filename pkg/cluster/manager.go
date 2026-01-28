@@ -55,10 +55,12 @@ func (m *Manager) Preflight(ctx context.Context) error {
 	// checking against the service list is more robust for "enabled" status.
 	// Also explicitly check for 'iam.googleapis.com' if we need it for service accounts,
 	// 'cloudresourcemanager.googleapis.com' for project checks, and
-	// 'certificatemanager.googleapis.com' for certificate management.
+	// 'certificatemanager.googleapis.com' for certificate management, and
+	// 'privateca.googleapis.com' for private certificate authority.
 	if err := m.gce.CheckServicesEnabled(ctx, []string{
 		"compute.googleapis.com",
 		"certificatemanager.googleapis.com",
+		"privateca.googleapis.com",
 	}); err != nil {
 		return err
 	}
