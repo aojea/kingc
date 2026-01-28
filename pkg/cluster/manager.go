@@ -37,6 +37,13 @@ type Manager struct {
 	gce *gce.Client
 }
 
+type ExternalAPIServerResult struct {
+	Endpoint string
+	CACert   []byte
+	SAKey    []byte
+	SAPub    []byte
+}
+
 func NewManager(client *gce.Client) *Manager {
 	return &Manager{gce: client}
 }
@@ -134,6 +141,8 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 	}
 
 	// 1.5 Ensure External APIServer (New Architecture)
+	var caCert, saKey, saPub []byte
+	var localKubeconfig string
 	{
 		defer m.measure("Ensure External APIServer")()
 
@@ -160,16 +169,72 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 			zone = "us-central1-a"
 		}
 
-		ep, err := m.EnsureExternalAPIServer(ctx, cfg, zone, netName, subName)
+		res, err := m.EnsureExternalAPIServer(ctx, cfg, zone, netName, subName)
 		if err != nil {
 			return fmt.Errorf("failed to ensure external apiserver: %v", err)
 		}
 		// Parse the endpoint IP into a URL
-		u, err := url.Parse(fmt.Sprintf("https://%s", net.JoinHostPort(ep, "6443")))
+		u, err := url.Parse(fmt.Sprintf("https://%s", net.JoinHostPort(res.Endpoint, "6443")))
 		if err != nil {
 			return fmt.Errorf("failed to parse external apiserver url: %v", err)
 		}
 		cfg.Spec.ExternalAPIServer = u
+
+		// Generate Admin Kubeconfig locally
+		{
+			klog.Infof("  > Generating local admin kubeconfig...")
+			// Generate Admin Key
+			adminKey, err := rsa.GenerateKey(rand.Reader, 2048)
+			if err != nil {
+				return fmt.Errorf("failed to generate admin key: %v", err)
+			}
+			adminKeyBytes := x509.MarshalPKCS1PrivateKey(adminKey)
+			adminKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: adminKeyBytes})
+
+			// Create CSR for system:masters
+			subj := pkix.Name{
+				CommonName:   "kubernetes-admin",
+				Organization: []string{"system:masters"},
+			}
+			template := x509.CertificateRequest{
+				Subject: subj,
+			}
+			csrBytes, err := x509.CreateCertificateRequest(rand.Reader, &template, adminKey)
+			if err != nil {
+				return fmt.Errorf("failed to create admin CSR: %v", err)
+			}
+			csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrBytes})
+
+			// Sign with CAS
+			poolID := fmt.Sprintf("kingc-pool-%s", cfg.Metadata.Name)
+			caID := fmt.Sprintf("kingc-ca-%s", cfg.Metadata.Name)
+			casRegion := cfg.Spec.Region
+
+			adminCertPEM, err := m.gce.SignCASCertificate(ctx, csrPEM, poolID, casRegion, caID)
+			if err != nil {
+				return fmt.Errorf("failed to sign admin certificate: %v", err)
+			}
+
+			// Generate Kubeconfig
+			kc := config.GenerateKubeconfig(
+				cfg.Metadata.Name,
+				cfg.Spec.ExternalAPIServer.String(),
+				res.CACert,
+				adminCertPEM,
+				adminKeyPEM,
+			)
+
+			localKubeconfig = filepath.Join(tmpDir, "admin.conf")
+			if err := os.WriteFile(localKubeconfig, []byte(kc), 0600); err != nil {
+				return fmt.Errorf("failed to write kubeconfig to %s: %v", localKubeconfig, err)
+			}
+			klog.Infof("    ✅ Kubeconfig generated locally at %s", localKubeconfig)
+		}
+
+		// Store PKI data for Control Plane provisioning
+		caCert = res.CACert
+		saKey = res.SAKey
+		saPub = res.SAPub
 	}
 
 	// 2. Load Balancer / Endpoint
@@ -247,6 +312,12 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 # ---------------------------------------------------------
 # Control Plane Bootstrap
 # ---------------------------------------------------------
+echo "👑 kingc: Writing PKI files..."
+mkdir -p /etc/kubernetes/pki
+echo "%s" > /etc/kubernetes/pki/ca.crt
+echo "%s" > /etc/kubernetes/pki/sa.key
+echo "%s" > /etc/kubernetes/pki/sa.pub
+
 echo "👑 kingc: Writing kubeadm config..."
 mkdir -p /etc/kubernetes
 cat <<EOF > /etc/kubernetes/kubeadm-config.yaml
@@ -257,7 +328,8 @@ echo "👑 kingc: Running kubeadm init..."
 kubeadm init --config /etc/kubernetes/kubeadm-config.yaml %s
 
 echo "👑 kingc: Control Plane Initialized"
-`, baseInstallScript, kubeadmConfig, kubeadmArgs)
+echo "👑 kingc: Control Plane Initialized"
+`, baseInstallScript, string(caCert), string(saKey), string(saPub), kubeadmConfig, kubeadmArgs)
 
 	tmpCPStartup := filepath.Join(tmpDir, "cp-startup.sh")
 	if err := os.WriteFile(tmpCPStartup, []byte(cpStartupScript), 0644); err != nil {
@@ -299,27 +371,7 @@ echo "👑 kingc: Control Plane Initialized"
 		}
 
 	}
-
-	// 7. Fetch Kubeconfig
-	var localKubeconfig string
-	{
-		defer m.measure("Fetch Kubeconfig")()
-		klog.Infof("  > Fetching admin.conf...")
-
-		kc, err := m.GetKubeconfig(ctx, cfg.Metadata.Name)
-		if err != nil {
-			return fmt.Errorf("failed to fetch kubeconfig: %v", err)
-		}
-
-		localKubeconfig = filepath.Join(tmpDir, "admin.conf")
-		if err := os.WriteFile(localKubeconfig, []byte(kc), 0600); err != nil {
-			return fmt.Errorf("failed to write kubeconfig to %s: %v", localKubeconfig, err)
-		}
-
-		klog.Infof("    ✅ Kubeconfig fetched (internal)")
-	}
-
-	// 8. Install Addons (CNI, CCM)
+	// Install Addons (CNI, CCM)
 	{
 		defer m.measure("Install Addons")()
 		klog.Infof("  > Installing Addons...")
@@ -753,7 +805,7 @@ func untar(dst string, r io.Reader) error {
 	}
 }
 
-func (m *Manager) EnsureExternalAPIServer(ctx context.Context, cfg *config.Cluster, zone, network, subnet string) (string, error) {
+func (m *Manager) EnsureExternalAPIServer(ctx context.Context, cfg *config.Cluster, zone, network, subnet string) (*ExternalAPIServerResult, error) {
 	name := fmt.Sprintf("%s-apiserver", basename(cfg.Metadata.Name))
 
 	// Assume image is in the current project's GCR
@@ -764,7 +816,7 @@ func (m *Manager) EnsureExternalAPIServer(ctx context.Context, cfg *config.Clust
 	// Check if already exists
 	ip, err := m.gce.EnsureStaticIP(ctx, name, cfg.Spec.Region)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	// --- PKI Setup with Google CAS ---
@@ -775,18 +827,18 @@ func (m *Manager) EnsureExternalAPIServer(ctx context.Context, cfg *config.Clust
 
 	// 1. Ensure Pool
 	if err := m.gce.CreateCASPool(ctx, poolID, casRegion); err != nil {
-		return "", fmt.Errorf("failed to create CAS pool: %v", err)
+		return nil, fmt.Errorf("failed to create CAS pool: %v", err)
 	}
 	// 2. Ensure Root CA
 	if err := m.gce.CreateCASRootCA(ctx, poolID, casRegion, caID, "kingc-ca"); err != nil {
-		return "", fmt.Errorf("failed to create CAS Root CA: %v", err)
+		return nil, fmt.Errorf("failed to create CAS Root CA: %v", err)
 	}
 
 	// 3. Generate CSR for API Server
 	// Generate local key
 	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return "", fmt.Errorf("failed to generate rsa key: %v", err)
+		return nil, fmt.Errorf("failed to generate rsa key: %v", err)
 	}
 	keyBytes := x509.MarshalPKCS1PrivateKey(privKey)
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: keyBytes})
@@ -808,7 +860,7 @@ func (m *Manager) EnsureExternalAPIServer(ctx context.Context, cfg *config.Clust
 	// Calculate the first IP of the Service CIDR (e.g. 10.96.0.1 for 10.96.0.0/12)
 	svcPrefix, err := netip.ParsePrefix(cfg.Spec.Kubernetes.Networking.ServiceCIDR)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse service cidr: %v", err)
+		return nil, fmt.Errorf("failed to parse service cidr: %v", err)
 	}
 	svcIP := svcPrefix.Addr().Next() // First IP is usually gateway/apiserver
 
@@ -825,20 +877,20 @@ func (m *Manager) EnsureExternalAPIServer(ctx context.Context, cfg *config.Clust
 	}
 	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, &template, privKey)
 	if err != nil {
-		return "", fmt.Errorf("failed to create CSR: %v", err)
+		return nil, fmt.Errorf("failed to create CSR: %v", err)
 	}
 	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrBytes})
 
 	// 4. Sign CSR
 	certPEM, err := m.gce.SignCASCertificate(ctx, csrPEM, poolID, casRegion, caID)
 	if err != nil {
-		return "", fmt.Errorf("failed to sign certificate: %v", err)
+		return nil, fmt.Errorf("failed to sign certificate: %v", err)
 	}
 
 	// 4.5 Get Root CA
 	caPEM, err := m.gce.GetCASRootCertificate(ctx, poolID, casRegion, caID)
 	if err != nil {
-		return "", fmt.Errorf("failed to get root CA: %v", err)
+		return nil, fmt.Errorf("failed to get root CA: %v", err)
 	}
 
 	// 5. Setup Service Account Keys
@@ -846,14 +898,14 @@ func (m *Manager) EnsureExternalAPIServer(ctx context.Context, cfg *config.Clust
 	// We generate them here ensuring the Manager is the source of truth.
 	saPrivKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return "", fmt.Errorf("failed to generate sa key: %v", err)
+		return nil, fmt.Errorf("failed to generate sa key: %v", err)
 	}
 	saKeyBytes := x509.MarshalPKCS1PrivateKey(saPrivKey)
 	saKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: saKeyBytes})
 
 	saPubKeyBytes, err := x509.MarshalPKIXPublicKey(&saPrivKey.PublicKey)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal sa public key: %v", err)
+		return nil, fmt.Errorf("failed to marshal sa public key: %v", err)
 	}
 	saPubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: saPubKeyBytes})
 
@@ -917,9 +969,14 @@ echo "%s" > /var/lib/kingc/pki/sa.pub
 		if strings.Contains(err.Error(), "already exists") {
 			klog.Infof("    Instance %s already exists", name)
 		} else {
-			return "", err
+			return nil, err
 		}
 	}
 
-	return ip, nil
+	return &ExternalAPIServerResult{
+		Endpoint: ip,
+		CACert:   caPEM,
+		SAKey:    saKeyPEM,
+		SAPub:    saPubPEM,
+	}, nil
 }
