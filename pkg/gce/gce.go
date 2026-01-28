@@ -280,9 +280,6 @@ func (c *Client) CreateInstance(ctx context.Context, name, zone, machineType, ne
 	if serviceAccount != "" {
 		args = append(args, "--service-account", serviceAccount)
 	}
-	if serviceAccount != "" {
-		args = append(args, "--service-account", serviceAccount)
-	}
 	_, err := c.Run(ctx, args...)
 	return err
 }
@@ -315,7 +312,6 @@ func (c *Client) CreateCASRootCA(ctx context.Context, poolID, region, caID, comm
 		"--key-algorithm", "rsa-pkcs1-2048-sha256",
 		"--max-chain-length", "2",
 		"--validity", "P10Y",
-		"--auto-approve",
 		"--quiet",
 	}
 	_, err := c.Run(ctx, args...)
