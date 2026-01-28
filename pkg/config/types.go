@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net/url"
 	"os"
 
 	"gopkg.in/yaml.v3"
@@ -35,6 +36,10 @@ type Spec struct {
 	WorkerGroups []NodeGroup `yaml:"workerGroups"`
 
 	KubeadmConfigPatches []string `yaml:"kubeadmConfigPatches"`
+
+	// ExternalAPIServer defines the external endpoint for the API server.
+	// This is an internal field populated by the provisioner, not exposed in YAML.
+	ExternalAPIServer *url.URL `yaml:"-"`
 }
 
 type Kubernetes struct {

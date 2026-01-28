@@ -1,13 +1,13 @@
 package gce
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/aojea/kingc/pkg/config"
 	"k8s.io/klog/v2"
@@ -85,35 +85,61 @@ func (c *Client) Run(ctx context.Context, args ...string) (string, error) {
 }
 
 // RunQuiet executes a command and returns only its stdout.
-// Stderr is ignored/discarded to prevent pollution of JSON output with warnings,
-// UNLESS verbosity is requested, in which case we stream Stderr to os.Stderr.
+// Stderr is ignored/discarded to prevent pollution of JSON output with warnings.
 func (c *Client) RunQuiet(ctx context.Context, args ...string) (string, error) {
-	args = c.argsWithVerbosity(args)
 	cmd := exec.CommandContext(ctx, "gcloud", args...)
 	cmd.Env = os.Environ()
-
-	// We only want Stdout for the return value
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-
-	// If Verbosity is set (and not "none"), we likely want to see logs (stderr) for debugging.
-	// RunQuiet is typically used for JSON commands where we parse stdout.
-	// If we mix stderr into stdout, JSON parsing fails.
-	// So we must separate them.
-	if c.Verbosity != "" && c.Verbosity != "none" {
-		cmd.Stderr = os.Stderr
-	}
-
-	err := cmd.Run()
+	// We only want Stdout
+	out, err := cmd.Output()
 	if err != nil {
-		// If we failed, strict return error.
-		// If we were piping stderr to os.Stderr, user sees it.
-		// If not, maybe we should include it in error?
-		// But we didn't capture it if we didn't pipe it or capture it.
-		// Let's rely on gcloud --verbosity providing enough info to stderr if connected.
 		return "", fmt.Errorf("command failed: gcloud %s: %v", strings.Join(args, " "), err)
 	}
-	return stdout.String(), nil
+	return string(out), nil
+}
+
+func (c *Client) CheckServicesEnabled(ctx context.Context, services []string) error {
+	// Check if services are enabled.
+	// We use 'gcloud services list --enabled --filter="config.name:(...)"' to verify.
+	// Construct filter string: config.name:(service1 OR service2 OR ...)
+	// Actually gcloud filter syntax for multiple values: config.name=(s1,s2,...)
+	if len(services) == 0 {
+		return nil
+	}
+
+	joinedServices := strings.Join(services, ",")
+	filter := fmt.Sprintf("config.name=(%s)", joinedServices)
+
+	type Service struct {
+		Config struct {
+			Name string `json:"name"`
+		} `json:"config"`
+	}
+	var enabledServices []Service
+
+	// We use RunJSON to get structured output
+	// Note: gcloud services list might require Service Usage API (serviceusage.googleapis.com)
+	// If that's not enabled, this might fail. But if it fails we can probably assume something is wrong.
+	if err := c.RunJSON(ctx, &enabledServices, "services", "list", "--enabled", "--filter", filter); err != nil {
+		return fmt.Errorf("failed to list enabled services: %v", err)
+	}
+
+	enabledMap := make(map[string]bool)
+	for _, s := range enabledServices {
+		enabledMap[s.Config.Name] = true
+	}
+
+	var missing []string
+	for _, s := range services {
+		if !enabledMap[s] {
+			missing = append(missing, s)
+		}
+	}
+
+	if len(missing) > 0 {
+		return fmt.Errorf("the following required Google Cloud APIs are not enabled: %s. Please enable them via 'gcloud services enable ...' or the Cloud Console", strings.Join(missing, ", "))
+	}
+
+	return nil
 }
 
 // RunJSON executes a gcloud command and unmarshals the output into the provided struct
@@ -254,6 +280,230 @@ func (c *Client) CreateInstance(ctx context.Context, name, zone, machineType, ne
 	if serviceAccount != "" {
 		args = append(args, "--service-account", serviceAccount)
 	}
+	if serviceAccount != "" {
+		args = append(args, "--service-account", serviceAccount)
+	}
+	_, err := c.Run(ctx, args...)
+	return err
+}
+
+// --- CAS (Private CA) Lifecycle ---
+
+func (c *Client) CreateCASPool(ctx context.Context, poolID, region string) error {
+	if _, err := c.RunQuiet(ctx, "privateca", "pools", "describe", poolID, "--location", region); err == nil {
+		return nil
+	}
+	args := []string{
+		"privateca", "pools", "create", poolID,
+		"--location", region,
+		"--tier", "DEVOPS",
+		"--quiet",
+	}
+	_, err := c.Run(ctx, args...)
+	return err
+}
+
+func (c *Client) CreateCASRootCA(ctx context.Context, poolID, region, caID, commonName string) error {
+	if _, err := c.RunQuiet(ctx, "privateca", "roots", "describe", caID, "--pool", poolID, "--location", region); err == nil {
+		return nil
+	}
+	args := []string{
+		"privateca", "roots", "create", caID,
+		"--pool", poolID,
+		"--location", region,
+		"--subject", fmt.Sprintf("CN=%s,O=kingc", commonName),
+		"--key-algorithm", "rsa-pkcs1-2048-sha256",
+		"--max-chain-length", "2",
+		"--validity", "P10Y",
+		"--auto-approve",
+		"--quiet",
+	}
+	_, err := c.Run(ctx, args...)
+	return err
+}
+
+func (c *Client) DeleteCASPool(ctx context.Context, poolID, region string) error {
+	args := []string{
+		"privateca", "pools", "delete", poolID,
+		"--location", region,
+		"--ignore-dependent-resources",
+		"--quiet",
+	}
+	_, err := c.Run(ctx, args...)
+	return err
+}
+
+func (c *Client) SignCASCertificate(ctx context.Context, csrPEM []byte, pool, location, caName string) ([]byte, error) {
+	tmpCsr, err := os.CreateTemp("", "kingc-csr-*.pem")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = os.Remove(tmpCsr.Name()) }()
+	if _, err := tmpCsr.Write(csrPEM); err != nil {
+		return nil, err
+	}
+	_ = tmpCsr.Close()
+
+	tmpCert, err := os.CreateTemp("", "kingc-cert-*.pem")
+	if err != nil {
+		return nil, err
+	}
+	_ = tmpCert.Close()
+	defer func() { _ = os.Remove(tmpCert.Name()) }()
+
+	// certID must be unique. Let's use a random suffix or timestamp.
+	// But `gcloud privateca certificates create` requires an ID.
+	// If we use current timestamp, it might collide if called very rapidly, but unlikely here.
+	certID := fmt.Sprintf("kingc-cert-%d", time.Now().UnixNano())
+	args := []string{
+		"privateca", "certificates", "create", certID,
+		"--csr-file", tmpCsr.Name(),
+		"--cert-output-file", tmpCert.Name(),
+		"--issuer-pool", pool,
+		"--issuer-location", location,
+		"--generate-request-id",
+		"--validity", "P1Y",
+		"--quiet",
+	}
+	if caName != "" {
+		args = append(args, "--issuer-ca", caName)
+	}
+
+	if _, err := c.Run(ctx, args...); err != nil {
+		return nil, fmt.Errorf("gcloud privateca failed: %v", err)
+	}
+
+	return os.ReadFile(tmpCert.Name())
+}
+
+func (c *Client) GetCASRootCertificate(ctx context.Context, poolID, region, caID string) ([]byte, error) {
+	// privateca roots describe ... --format="value(pemCaCertificates)"
+	args := []string{
+		"privateca", "roots", "describe", caID,
+		"--pool", poolID,
+		"--location", region,
+		"--format", "value(pemCaCertificates)",
+	}
+	out, err := c.RunQuiet(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(strings.TrimSpace(out)), nil
+}
+
+func (c *Client) CreateContainerInstance(
+	ctx context.Context,
+	name, zone, machineType, network, subnet,
+	containerImage string,
+	containerMounts []string, // e.g. "host-path=/tmp,mount-path=/tmp,mode=rw"
+	containerEnv map[string]string,
+	containerArgs []string,
+	address string,
+	tags []string,
+	metadata map[string]string, // e.g. startup-script
+) error {
+	args := []string{
+		"compute", "instances", "create-with-container", name,
+		"--zone", zone,
+		"--machine-type", machineType,
+		"--network", network,
+		"--subnet", subnet,
+		"--container-image", containerImage,
+		"--image-project", "cos-cloud",
+		"--image-family", "cos-stable", // Use COS for container instances
+		"--boot-disk-size", "50GB",
+		"--scopes", "cloud-platform",
+		"--tags", strings.Join(tags, ","),
+	}
+
+	if address != "" {
+		args = append(args, "--address", address)
+	}
+
+	for _, m := range containerMounts {
+		args = append(args, "--container-mount-host-path", m)
+	}
+
+	for k, v := range containerEnv {
+		args = append(args, "--container-env", fmt.Sprintf("%s=%s", k, v))
+	}
+
+	for _, arg := range containerArgs {
+		args = append(args, "--container-arg", arg)
+	}
+
+	if len(metadata) > 0 {
+		var metaList []string
+		for k, v := range metadata {
+			// If v is a file path? Gcloud supports key=value or key=file
+			// Assuming key=value or key=file passed directly as string
+			metaList = append(metaList, fmt.Sprintf("%s=%s", k, v))
+		}
+		args = append(args, "--metadata", strings.Join(metaList, ","))
+	}
+
+	// We might need --metadata-from-file if the value is a file path
+	// But let's assume the caller handles writing files if needed or passes metadata directly.
+	// Actually, gcloud `create-with-container` supports `--metadata-from-file`.
+	// Let's add specific support if needed, or just let metadata map handle key=value.
+	// NOTE: gcloud --metadata flag takes key=value.
+	// If the user wants to pass a script content, they usually use --metadata-from-file startup-script=PATH.
+	// Let's overload `metadata` to allow FILE references if they start with FILE:?
+	// Or just add a specific argument for startup script file?
+	// Let's add `metadataFromFile` map.
+
+	_, err := c.Run(ctx, args...)
+	return err
+}
+
+func (c *Client) CreateContainerInstanceWithMetadataFiles(
+	ctx context.Context,
+	name, zone, machineType, network, subnet,
+	containerImage string,
+	containerMounts []string,
+	containerEnv map[string]string,
+	tags []string,
+	metadata map[string]string,
+	metadataFiles map[string]string,
+) error {
+	args := []string{
+		"compute", "instances", "create-with-container", name,
+		"--zone", zone,
+		"--machine-type", machineType,
+		"--network", network,
+		"--subnet", subnet,
+		"--container-image", containerImage,
+		"--image-project", "cos-cloud",
+		"--image-family", "cos-stable",
+		"--boot-disk-size", "50GB",
+		"--scopes", "cloud-platform",
+		"--tags", strings.Join(tags, ","),
+	}
+
+	for _, m := range containerMounts {
+		args = append(args, "--container-mount-host-path", m)
+	}
+
+	for k, v := range containerEnv {
+		args = append(args, "--container-env", fmt.Sprintf("%s=%s", k, v))
+	}
+
+	if len(metadata) > 0 {
+		var metaList []string
+		for k, v := range metadata {
+			metaList = append(metaList, fmt.Sprintf("%s=%s", k, v))
+		}
+		args = append(args, "--metadata", strings.Join(metaList, ","))
+	}
+
+	if len(metadataFiles) > 0 {
+		var metaFilesList []string
+		for k, v := range metadataFiles {
+			metaFilesList = append(metaFilesList, fmt.Sprintf("%s=%s", k, v))
+		}
+		args = append(args, "--metadata-from-file", strings.Join(metaFilesList, ","))
+	}
+
 	_, err := c.Run(ctx, args...)
 	return err
 }
