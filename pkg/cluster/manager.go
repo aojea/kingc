@@ -207,7 +207,8 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 
 	templateData := map[string]interface{}{
 		"ClusterName":           cfg.Metadata.Name,
-		"ControlPlaneEndpoint":  cfg.Spec.ExternalAPIServer,
+		"ControlPlaneEndpoint":  cfg.Spec.ExternalAPIServer.Host,
+		"ControlPlaneIP":        cfg.Spec.ExternalAPIServer.Hostname(),
 		"KubernetesVersion":     cfg.Spec.Kubernetes.Version,
 		"KubernetesRepoVersion": repoVer,
 		"PodSubnet":             cfg.Spec.Kubernetes.Networking.PodCIDR,

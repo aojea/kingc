@@ -8,7 +8,7 @@ apiVersion: kubeadm.k8s.io/v1beta3
 kind: ClusterConfiguration
 clusterName: {{ .ClusterName }}
 kubernetesVersion: {{ .KubernetesVersion }}
-controlPlaneEndpoint: "{{ .ControlPlaneEndpoint }}:6443"
+controlPlaneEndpoint: "{{ .ControlPlaneEndpoint }}"
 networking:
   podSubnet: "{{ .PodSubnet }}"
   serviceSubnet: "{{ .ServiceSubnet }}"
@@ -19,7 +19,7 @@ featureGates:
 {{- end }}
 apiServer:
   certSANs:
-    - "{{ .ControlPlaneEndpoint }}"
+    - "{{ .ControlPlaneIP }}"
     - "127.0.0.1"
   extraArgs:
     authorization-mode: "Node,RBAC"
@@ -29,4 +29,5 @@ apiServer:
 controllerManager:
   extraArgs:
     cloud-provider: "external"
-scheduler: {}
+scheduler:
+  extraArgs:
