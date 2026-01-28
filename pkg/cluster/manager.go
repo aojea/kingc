@@ -7,10 +7,12 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"embed"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -305,7 +307,7 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 
 	// Construct the CP startup script
 	// apiserver and etcd are already running in the external apiserver
-	kubeadmArgs := "--upload-certs --ignore-preflight-errors=NumCPU --skip-phases=etcd,control-plane/apiserver"
+	kubeadmArgs := "--upload-certs --ignore-preflight-errors=NumCPU --skip-phases=etcd,control-plane/apiserver,certs/apiserver,certs/apiserver-kubelet-client,certs/front-proxy-client,certs/etcd-healthcheck-client,certs/apiserver-etcd-client"
 
 	cpStartupScript := fmt.Sprintf(`%s
 
@@ -395,16 +397,18 @@ echo "👑 kingc: Control Plane Initialized"
 
 	}
 
-	// Worker Pools
+	// 9. Worker Pools
 	{
 		defer m.measure("Worker Groups Provisioning")()
 		klog.Infof("  > Provisioning Worker Groups...")
-		tokenCmd := "sudo /usr/bin/kubeadm token create --print-join-command"
-		joinCommand, err := m.gce.RunSSHOutput(ctx, cpName, cpZone, tokenCmd)
+
+		// Generate Join Command locally
+		// We calculate CA Cert Hash and create a Bootstrap Token Secret
+		joinCommand, err := m.generateJoinCommand(ctx, localKubeconfig, cfg.Spec.ExternalAPIServer.Host, caCert)
 		if err != nil {
-			return fmt.Errorf("failed to get join command: %v", err)
+			return fmt.Errorf("failed to generate join command: %v", err)
 		}
-		joinCommand = strings.TrimSpace(joinCommand)
+		// joinCommand is like "kubeadm join host:port --token ... --discovery-token-ca-cert-hash ..."
 
 		workerStartup := fmt.Sprintf(`%s
 
@@ -980,4 +984,78 @@ echo "%s" > /var/lib/kingc/pki/sa.pub
 		SAKey:    saKeyPEM,
 		SAPub:    saPubPEM,
 	}, nil
+}
+
+func (m *Manager) generateJoinCommand(ctx context.Context, kubeconfigPath, controlPlaneEndpoint string, caCert []byte) (string, error) {
+	// 1. Calculate CA Cert Hash (Discovery Token CA Cert Hash)
+	// openssl x509 -in ca.crt -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256
+	// Go: sha256(SubjectPublicKeyInfo)
+	block, _ := pem.Decode(caCert)
+	if block == nil {
+		return "", fmt.Errorf("failed to decode CA cert PEM")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse CA cert: %v", err)
+	}
+	pubKeyDer, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal public key: %v", err)
+	}
+	hash := sha256.Sum256(pubKeyDer)
+	caHash := fmt.Sprintf("sha256:%s", hex.EncodeToString(hash[:]))
+
+	// 2. Create Bootstrap Token
+	// ID: 6 chars, Secret: 16 chars (hex/alphanum? [a-z0-9])
+	// kubeadm uses random lowercase alphanum
+	tokenID := randString(6)
+	tokenSecret := randString(16)
+	token := fmt.Sprintf("%s.%s", tokenID, tokenSecret)
+
+	// Create Secret in kube-system
+	// We use text/template or just fmt.Sprintf for the Secret manifest
+	secretName := fmt.Sprintf("bootstrap-token-%s", tokenID)
+	// Expiration: 24h
+	expiration := time.Now().Add(24 * time.Hour).Format(time.RFC3339)
+
+	secretYAML := fmt.Sprintf(`apiVersion: v1
+kind: Secret
+metadata:
+  name: %s
+  namespace: kube-system
+type: bootstrap.kubernetes.io/token
+stringData:
+  token-id: "%s"
+  token-secret: "%s"
+  usage-bootstrap-authentication: "true"
+  usage-bootstrap-signing: "true"
+  expiration: "%s"
+`, secretName, tokenID, tokenSecret, expiration)
+
+	tmpSecret := filepath.Join(filepath.Dir(kubeconfigPath), "bootstrap-token.yaml")
+	if err := os.WriteFile(tmpSecret, []byte(secretYAML), 0644); err != nil {
+		return "", err
+	}
+
+	cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", kubeconfigPath, "apply", "-f", tmpSecret)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("failed to create bootstrap token: %v, out: %s", err, out)
+	}
+
+	// 3. Construct Join Command
+	// kubeadm join <endpoint> --token <token> --discovery-token-ca-cert-hash <hash>
+	return fmt.Sprintf("kubeadm join %s --token %s --discovery-token-ca-cert-hash %s", controlPlaneEndpoint, token, caHash), nil
+}
+
+func randString(n int) string {
+	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, n)
+	_, err := rand.Read(b)
+	if err != nil {
+		return "abcdef"
+	}
+	for i := range b {
+		b[i] = letters[int(b[i])%len(letters)]
+	}
+	return string(b)
 }
