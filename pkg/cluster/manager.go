@@ -165,7 +165,7 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 			return fmt.Errorf("failed to ensure external apiserver: %v", err)
 		}
 		// Parse the endpoint IP into a URL
-		u, err := url.Parse(fmt.Sprintf("https://%s:6443", ep))
+		u, err := url.Parse(fmt.Sprintf("https://%s", net.JoinHostPort(ep, "6443")))
 		if err != nil {
 			return fmt.Errorf("failed to parse external apiserver url: %v", err)
 		}
