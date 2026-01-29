@@ -310,6 +310,7 @@ echo "%s" > /etc/kubernetes/pki/node-ca.key
 
 # Front-proxy CA
 echo "%s" > /etc/kubernetes/pki/front-proxy-ca.crt
+touch /etc/kubernetes/pki/front-proxy-ca.key
 
 echo "👑 kingc: Writing Kubeconfigs..."
 echo "%s" > /etc/kubernetes/admin.conf
