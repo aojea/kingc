@@ -3,6 +3,14 @@ kind: InitConfiguration
 localAPIEndpoint:
   advertiseAddress: "{{ .ControlPlaneIP }}"
   bindPort: 6443
+bootstrapTokens:
+- groups:
+  - system:bootstrappers:kubeadm:default-node-token
+  token: "{{ .BootstrapToken }}"
+  ttl: 24h0m0s
+  usages:
+  - signing
+  - authentication
 nodeRegistration:
   criSocket: "unix:///var/run/containerd/containerd.sock"
   imagePullPolicy: IfNotPresent

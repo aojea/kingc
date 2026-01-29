@@ -260,7 +260,7 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 	var bootstrapToken, caHash string
 	{
 		klog.Infof("  > Creating Bootstrap Token...")
-		bootstrapToken, caHash, err = m.createBootstrapToken(ctx, localKubeconfig, caCert)
+		bootstrapToken, caHash, err = m.createBootstrapToken(caCert)
 		if err != nil {
 			return fmt.Errorf("create bootstrap token: %v", err)
 		}
@@ -318,10 +318,11 @@ kubeadm init phase control-plane controller-manager --config /etc/kubernetes/kub
 kubeadm init phase control-plane scheduler --config /etc/kubernetes/kubeadm-config.yaml
 kubeadm init phase kubelet-start --config /etc/kubernetes/kubeadm-config.yaml
 # need to wait for the apiserver to be ready
+kubeadm init phase wait-control-plane 
 
 kubeadm init phase bootstrap-token --config /etc/kubernetes/kubeadm-config.yaml
 kubeadm init phase upload-config all --config /etc/kubernetes/kubeadm-config.yaml
-# mark-control-plane
+
 kubeadm init phase mark-control-plane --config /etc/kubernetes/kubeadm-config.yaml
 kubeadm init phase addon all --config /etc/kubernetes/kubeadm-config.yaml
 kubeadm init phase kubelet-finalize all --config /etc/kubernetes/kubeadm-config.yaml

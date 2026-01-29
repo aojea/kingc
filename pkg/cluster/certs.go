@@ -1,7 +1,6 @@
 package cluster
 
 import (
-	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -13,9 +12,6 @@ import (
 	"fmt"
 	"math/big"
 	"net"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"time"
 )
 
@@ -96,7 +92,9 @@ func ParseCertificatePEM(data []byte) (*x509.Certificate, error) {
 	}
 	return x509.ParseCertificate(block.Bytes)
 }
-func (m *Manager) createBootstrapToken(ctx context.Context, kubeconfigPath string, caCert []byte) (token string, caHash string, err error) {
+
+// createBootstrapToken generates a random bootstrap token and calculates the CA cert hash.
+func (m *Manager) createBootstrapToken(caCert []byte) (token string, caHash string, err error) {
 	// 1. Calculate CA Cert Hash (Discovery Token CA Cert Hash)
 	// openssl x509 -in ca.crt -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256
 	// Go: sha256(SubjectPublicKeyInfo)
@@ -122,84 +120,5 @@ func (m *Manager) createBootstrapToken(ctx context.Context, kubeconfigPath strin
 	tokenSecret := randString(16)
 	token = fmt.Sprintf("%s.%s", tokenID, tokenSecret)
 
-	// Create Secret in kube-system
-	// We use text/template or just fmt.Sprintf for the Secret manifest
-	secretName := fmt.Sprintf("bootstrap-token-%s", tokenID)
-	// Expiration: 24h
-	expiration := time.Now().Add(24 * time.Hour).Format(time.RFC3339)
-
-	secretYAML := fmt.Sprintf(`apiVersion: v1
-kind: Secret
-metadata:
-  name: %s
-  namespace: kube-system
-type: bootstrap.kubernetes.io/token
-stringData:
-  token-id: "%s"
-  token-secret: "%s"
-  usage-bootstrap-authentication: "true"
-  usage-bootstrap-signing: "true"
-  expiration: "%s"
-`, secretName, tokenID, tokenSecret, expiration)
-
-	tmpSecret := filepath.Join(filepath.Dir(kubeconfigPath), "bootstrap-token.yaml")
-	if err := os.WriteFile(tmpSecret, []byte(secretYAML), 0644); err != nil {
-		return "", "", err
-	}
-
-	cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", kubeconfigPath, "apply", "-f", tmpSecret)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", "", fmt.Errorf("failed to create bootstrap token: %v, out: %s", err, out)
-	}
-
 	return token, caHash, nil
-}
-
-func (m *Manager) generateSignedCert(caKeyPEM, caCertPEM []byte, cn string, orgs []string) (keyPEM, certPEM []byte, err error) {
-	// Parse CA
-	caBlock, _ := pem.Decode(caCertPEM)
-	if caBlock == nil {
-		return nil, nil, fmt.Errorf("failed to decode ca cert")
-	}
-	caCert, err := x509.ParseCertificate(caBlock.Bytes)
-	if err != nil {
-		return nil, nil, fmt.Errorf("parse ca cert: %v", err)
-	}
-	caKeyBlock, _ := pem.Decode(caKeyPEM)
-	if caKeyBlock == nil {
-		return nil, nil, fmt.Errorf("failed to decode ca key")
-	}
-	caKey, err := x509.ParsePKCS1PrivateKey(caKeyBlock.Bytes)
-	if err != nil {
-		return nil, nil, fmt.Errorf("parse ca key: %v", err)
-	}
-
-	// Generate Key
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return nil, nil, fmt.Errorf("generate key: %v", err)
-	}
-	keyBytes := x509.MarshalPKCS1PrivateKey(key)
-	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: keyBytes})
-
-	// Cert Template
-	tmpl := x509.Certificate{
-		SerialNumber: big.NewInt(2), // Randomize?
-		Subject: pkix.Name{
-			CommonName:   cn,
-			Organization: orgs,
-		},
-		NotBefore:             time.Now().Add(-1 * time.Hour),
-		NotAfter:              time.Now().Add(1 * 365 * 24 * time.Hour), // 1 year
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-		BasicConstraintsValid: true,
-	}
-
-	certBytes, err := x509.CreateCertificate(rand.Reader, &tmpl, caCert, &key.PublicKey, caKey)
-	if err != nil {
-		return nil, nil, fmt.Errorf("create cert: %v", err)
-	}
-	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certBytes})
-	return keyPEM, certPEM, nil
 }
