@@ -678,6 +678,10 @@ func (m *Manager) GetKubeconfig(ctx context.Context, clusterName string) (string
 	return strings.TrimSpace(out), nil
 }
 
+func (m *Manager) ListNodes(ctx context.Context, clusterName string) ([]gce.Instance, error) {
+	return m.gce.ListInstances(ctx, []string{basename(clusterName)})
+}
+
 func (m *Manager) ExportLogs(ctx context.Context, clusterName, outDir string) error {
 	nodes, err := m.gce.ListInstances(ctx, []string{basename(clusterName)})
 	if err != nil {
