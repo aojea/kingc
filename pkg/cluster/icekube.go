@@ -345,7 +345,7 @@ echo "%s" > /var/lib/kingc/pki/front-proxy-client.key
 
 	return &ExternalAPIServerResult{
 		Endpoint:                    ip,
-		CACert:                      clusterCACertPEM,
+		CACert:                      append(clusterCACertPEM, nodeCACertPEM...), // Bundle (Cluster + Node)
 		SigningKey:                  nodeCAKeyPEM,
 		SigningCert:                 nodeCACertPEM,
 		SAKey:                       saKeyPEM,

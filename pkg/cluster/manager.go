@@ -140,7 +140,7 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 	}
 
 	// 1.5 Ensure External APIServer (New Architecture)
-	var caCert, saPub, signingKey, signingCert, frontProxyCACert []byte
+	var caCert, saPub, saKey, signingKey, signingCert, frontProxyCACert []byte
 	var localKubeconfig string
 	var adminKubeconfig, schedulerKubeconfig, cmKubeconfig string
 
@@ -198,6 +198,7 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 		saPub = res.SAPub
 		// Signing CA for KCM
 		// We'll write these to the CP node
+		saKey = res.SAKey
 		signingKey = res.SigningKey
 		signingCert = res.SigningCert
 		frontProxyCACert = res.FrontProxyCACert
@@ -298,11 +299,14 @@ echo "%s" > /etc/kubernetes/pki/ca.crt
 # TODO(aojea): This is needed to avoid to fail kubeadm init validation
 # for external CA names
 touch /etc/kubernetes/pki/ca.key
+
+# Service Account Keys/Pub
 echo "%s" > /etc/kubernetes/pki/sa.pub
+echo "%s" > /etc/kubernetes/pki/sa.key
 
 # Signing CA for KCM (CSR Signing)
-echo "%s" > /etc/kubernetes/pki/signing-ca.key
-echo "%s" > /etc/kubernetes/pki/signing-ca.crt
+echo "%s" > /etc/kubernetes/pki/node-ca.crt
+echo "%s" > /etc/kubernetes/pki/node-ca.key
 
 # Front-proxy CA
 echo "%s" > /etc/kubernetes/pki/front-proxy-ca.crt
@@ -332,7 +336,7 @@ kubeadm init phase kubelet-finalize all --config /etc/kubernetes/kubeadm-config.
 kubeadm init phase mark-control-plane --config /etc/kubernetes/kubeadm-config.yaml
 
 echo "👑 kingc: Control Plane Bootstrapped"
-`, baseInstallScript, string(caCert), string(saPub), string(signingKey), string(signingCert), string(frontProxyCACert),
+`, baseInstallScript, string(caCert), string(saPub), string(saKey), string(signingCert), string(signingKey), string(frontProxyCACert),
 		templateData["Kubeconfig"], templateData["SchedulerKubeconfig"], templateData["ControllerManagerKubeconfig"],
 		kubeadmConfig)
 
