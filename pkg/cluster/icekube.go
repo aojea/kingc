@@ -342,12 +342,18 @@ echo "%s" > /var/lib/kingc/pki/front-proxy-client.key
 			return nil, err
 		}
 	}
+	// Extract leaf for SigningCert (KCM expects single cert)
+	nodeCALeafPEM := nodeCACertPEM
+	if block, _ := pem.Decode(nodeCACertPEM); block != nil {
+		nodeCALeafPEM = pem.EncodeToMemory(block)
+	}
 
 	return &ExternalAPIServerResult{
-		Endpoint:                    ip,
-		CACert:                      append(clusterCACertPEM, nodeCACertPEM...), // Bundle (Cluster + Node)
+		Endpoint: ip,
+		// Bundle: Cluster CA + Node CA Bundle (for trust)
+		CACert:                      append(clusterCACertPEM, nodeCACertPEM...),
 		SigningKey:                  nodeCAKeyPEM,
-		SigningCert:                 nodeCACertPEM,
+		SigningCert:                 nodeCALeafPEM, // Single Cert for KCM
 		SAKey:                       saKeyPEM,
 		SAPub:                       saPubPEM,
 		FrontProxyCACert:            fpCACertPEM,
