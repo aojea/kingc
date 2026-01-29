@@ -35,6 +35,8 @@ type ExternalAPIServerResult struct {
 	// Service Account Keys/Pub
 	SAKey []byte
 	SAPub []byte
+	// Front Proxy CA
+	FrontProxyCACert []byte
 	// Kubeconfigs (generated during CA lifecycle)
 	AdminKubeconfig             string
 	SchedulerKubeconfig         string
@@ -138,7 +140,7 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 	}
 
 	// 1.5 Ensure External APIServer (New Architecture)
-	var caCert, saPub, signingKey, signingCert []byte
+	var caCert, saPub, signingKey, signingCert, frontProxyCACert []byte
 	var localKubeconfig string
 	var adminKubeconfig, schedulerKubeconfig, cmKubeconfig string
 
@@ -198,6 +200,7 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 		// We'll write these to the CP node
 		signingKey = res.SigningKey
 		signingCert = res.SigningCert
+		frontProxyCACert = res.FrontProxyCACert
 	}
 
 	// 2. Load Balancer / Endpoint
@@ -301,6 +304,9 @@ echo "%s" > /etc/kubernetes/pki/sa.pub
 echo "%s" > /etc/kubernetes/pki/signing-ca.key
 echo "%s" > /etc/kubernetes/pki/signing-ca.crt
 
+# Front-proxy CA
+echo "%s" > /etc/kubernetes/pki/front-proxy-ca.crt
+
 echo "👑 kingc: Writing Kubeconfigs..."
 echo "%s" > /etc/kubernetes/admin.conf
 echo "%s" > /etc/kubernetes/scheduler.conf
@@ -326,7 +332,7 @@ kubeadm init phase kubelet-finalize all --config /etc/kubernetes/kubeadm-config.
 kubeadm init phase mark-control-plane --config /etc/kubernetes/kubeadm-config.yaml
 
 echo "👑 kingc: Control Plane Bootstrapped"
-`, baseInstallScript, string(caCert), string(saPub), string(signingKey), string(signingCert),
+`, baseInstallScript, string(caCert), string(saPub), string(signingKey), string(signingCert), string(frontProxyCACert),
 		templateData["Kubeconfig"], templateData["SchedulerKubeconfig"], templateData["ControllerManagerKubeconfig"],
 		kubeadmConfig)
 
