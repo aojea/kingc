@@ -79,6 +79,7 @@ spec:
       - operator: Exists
         effect: NoSchedule
       serviceAccountName: kindnet
+      priorityClassName: system-node-critical
       initContainers:
       - name: install-cni-bin
         image: {{ .KindnetImage }}
