@@ -16,6 +16,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/netip"
@@ -40,11 +41,13 @@ type Manager struct {
 }
 
 type ExternalAPIServerResult struct {
-	Endpoint   string
-	CACert     []byte
-	SAKey      []byte
-	SAPub      []byte
-	Kubeconfig string
+	Endpoint    string
+	CACert      []byte
+	SigningKey  []byte // New: For KCM CSR Signing
+	SigningCert []byte // New: For KCM CSR Signing
+	SAKey       []byte
+	SAPub       []byte
+	Kubeconfig  string
 }
 
 func NewManager(client *gce.Client) *Manager {
@@ -144,9 +147,9 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 	}
 
 	// 1.5 Ensure External APIServer (New Architecture)
-	var caCert, saKey, saPub []byte
+	var caCert, saPub, signingKey, signingCert []byte
 	var localKubeconfig string
-	var adminKubeconfig, schedulerKubeconfig, cmKubeconfig, kubeletKubeconfig string
+	var adminKubeconfig, schedulerKubeconfig, cmKubeconfig string
 
 	{
 		defer m.measure("Ensure External APIServer")()
@@ -211,19 +214,15 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 			if err != nil {
 				return fmt.Errorf("signing controller-manager kubeconfig: %v", err)
 			}
-
-			// 4. Kubelet (for the first CP node)
-			cpName := fmt.Sprintf("%s-cp", basename(cfg.Metadata.Name))
-			kubeletKubeconfig, err = m.signKubeconfig(ctx, cfg, fmt.Sprintf("system:node:%s", cpName), []string{"system:nodes"}, res.CACert)
-			if err != nil {
-				return fmt.Errorf("signing kubelet kubeconfig: %v", err)
-			}
 		}
 
 		// Store PKI data for Control Plane provisioning
 		caCert = res.CACert
-		saKey = res.SAKey
 		saPub = res.SAPub
+		// Signing CA for KCM
+		// We'll write these to the CP node
+		signingKey = res.SigningKey
+		signingCert = res.SigningCert
 	}
 
 	// 2. Load Balancer / Endpoint
@@ -274,7 +273,6 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 		"Kubeconfig":                  adminKubeconfig,
 		"SchedulerKubeconfig":         schedulerKubeconfig,
 		"ControllerManagerKubeconfig": cmKubeconfig,
-		"KubeletKubeconfig":           kubeletKubeconfig,
 	}
 
 	// Render the base installation script
@@ -283,8 +281,22 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 		return err
 	}
 
+	// 3.5 Create Bootstrap Token (Early)
+	var bootstrapToken, caHash string
+	{
+		klog.Infof("  > Creating Bootstrap Token...")
+		bootstrapToken, caHash, err = m.createBootstrapToken(ctx, localKubeconfig, caCert)
+		if err != nil {
+			return fmt.Errorf("create bootstrap token: %v", err)
+		}
+		// Add to template data
+		templateData["BootstrapToken"] = bootstrapToken
+		templateData["DiscoveryTokenCaCertHash"] = caHash
+	}
+
 	// 4. Prepare Control Plane Config & Script
-	klog.Infof("  > Generating Kubeadm config...")
+	klog.Infof("  > Generating Kubeadm Join config for Control Plane...")
+	// We use JoinConfiguration now
 	kubeadmConfig, err := m.renderTemplate("templates/kubeadm-config.yaml", templateData)
 	if err != nil {
 		return err
@@ -297,26 +309,28 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 	}
 
 	// Construct the CP startup script
-	// apiserver and etcd are already running in the external apiserver
-	// We skip certs phases (external CA/SA) and kubeconfig phases (we provide them)
-	kubeadmArgs := "--ignore-preflight-errors=NumCPU --skip-phases=etcd,control-plane/apiserver,certs/apiserver,certs/apiserver-kubelet-client,certs/front-proxy-client,certs/etcd-healthcheck-client,certs/apiserver-etcd-client,kubeconfig/all"
+	// We run kubeadm join (worker mode) but with CP labels/taints
+	kubeadmArgs := "--ignore-preflight-errors=NumCPU"
 
 	cpStartupScript := fmt.Sprintf(`%s
 
 # ---------------------------------------------------------
 # Control Plane Bootstrap
 # ---------------------------------------------------------
-echo "👑 kingc: Writing PKI files..."
+echo "👑 kingc: Writing PKI files (SA Keys & Signing CA)..."
 mkdir -p /etc/kubernetes/pki
-echo "%s" > /etc/kubernetes/pki/ca.crt
-echo "%s" > /etc/kubernetes/pki/sa.key
+# CA Cert will be fetched by kubeadm join, but we can pre-populate if we want.
+# However, SA keys are NOT fetched by worker join, so we MUST provide them for CM.
 echo "%s" > /etc/kubernetes/pki/sa.pub
+
+# Signing CA for KCM (CSR Signing)
+echo "%s" > /etc/kubernetes/pki/signing-ca.key
+echo "%s" > /etc/kubernetes/pki/signing-ca.crt
 
 echo "👑 kingc: Writing Kubeconfigs..."
 echo "%s" > /etc/kubernetes/admin.conf
 echo "%s" > /etc/kubernetes/scheduler.conf
 echo "%s" > /etc/kubernetes/controller-manager.conf
-echo "%s" > /etc/kubernetes/kubelet.conf
 
 echo "👑 kingc: Writing kubeadm config..."
 mkdir -p /etc/kubernetes
@@ -324,16 +338,39 @@ cat <<EOF > /etc/kubernetes/kubeadm-config.yaml
 %s
 EOF
 
-echo "👑 kingc: Running kubeadm init..."
-kubeadm init --config /etc/kubernetes/kubeadm-config.yaml %s
+ARGS="%s"
+echo "👑 kingc: Joining Control Plane Node..."
+kubeadm join --config /etc/kubernetes/kubeadm-config.yaml $ARGS
 
-echo "👑 kingc: Control Plane Initialized"
-echo "👑 kingc: Control Plane Initialized"
-`, baseInstallScript, string(caCert), string(saKey), string(saPub), templateData["Kubeconfig"], templateData["SchedulerKubeconfig"], templateData["ControllerManagerKubeconfig"], templateData["KubeletKubeconfig"], kubeadmConfig, kubeadmArgs)
+echo "👑 kingc: Control Plane Joined"
+`, baseInstallScript, string(saPub), string(signingKey), string(signingCert), templateData["Kubeconfig"], templateData["SchedulerKubeconfig"], templateData["ControllerManagerKubeconfig"], kubeadmConfig, kubeadmArgs)
 
 	tmpCPStartup := filepath.Join(tmpDir, "cp-startup.sh")
 	if err := os.WriteFile(tmpCPStartup, []byte(cpStartupScript), 0644); err != nil {
 		return fmt.Errorf("failed to write startup script: %v", err)
+	}
+
+	// 4.5 Apply Control Plane Manifests (Scheduler, Controller Manager)
+	{
+		defer m.measure("Apply CP Manifests")()
+		klog.Infof("  > Applying Control Plane Manifests...")
+
+		manifests := []string{"kube-scheduler.yaml", "kube-controller-manager.yaml"}
+		for _, man := range manifests {
+			out, err := m.renderTemplate("templates/"+man, templateData)
+			if err != nil {
+				return err
+			}
+			tmpMan := filepath.Join(tmpDir, man)
+			if err := os.WriteFile(tmpMan, []byte(out), 0644); err != nil {
+				return err
+			}
+			cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", localKubeconfig, "apply", "-f", tmpMan)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("failed to apply %s: %v, output: %s", man, err, out)
+			}
+			klog.Infof("    ✅ Applied %s", man)
+		}
 	}
 
 	// 5. Provision Control Plane
@@ -353,7 +390,6 @@ echo "👑 kingc: Control Plane Initialized"
 		cpZone = cfg.Spec.ControlPlane.Zone
 		cpName = fmt.Sprintf("%s-cp", cfg.Metadata.Name)
 
-		// GCP External Passthrough LB delivers packets to the VM.
 		klog.Infof("  > Provisioning Control Plane VM (%s)...", cpZone)
 		err = m.gce.CreateInstance(
 			ctx,
@@ -400,13 +436,9 @@ echo "👑 kingc: Control Plane Initialized"
 		defer m.measure("Worker Groups Provisioning")()
 		klog.Infof("  > Provisioning Worker Groups...")
 
-		// Generate Join Command locally
-		// We calculate CA Cert Hash and create a Bootstrap Token Secret
-		joinCommand, err := m.generateJoinCommand(ctx, localKubeconfig, cfg.Spec.ExternalAPIServer.Host, caCert)
-		if err != nil {
-			return fmt.Errorf("failed to generate join command: %v", err)
-		}
+		// Generate Join Command locally (reusing existing token info)
 		// joinCommand is like "kubeadm join host:port --token ... --discovery-token-ca-cert-hash ..."
+		joinCommand := fmt.Sprintf("kubeadm join %s --token %s --discovery-token-ca-cert-hash %s", cfg.Spec.ExternalAPIServer.Host, bootstrapToken, caHash)
 
 		workerStartup := fmt.Sprintf(`%s
 
@@ -545,6 +577,29 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 					} else {
 						klog.Infof("    ✅ Done")
 					}
+				}
+			}
+		}
+	}
+
+	// Delete Instance Templates
+	{
+		defer m.measure("Instance Templates Cleanup")()
+		klog.Infof("  > Cleaning up Instance Templates...")
+		filter := fmt.Sprintf("name:%s*", name)
+
+		out, err := m.gce.RunQuiet(ctx, "compute", "instance-templates", "list", "--filter", filter, "--format=value(name)", "--quiet")
+		if err != nil {
+			klog.Warningf("    ⚠️  Failed to list instance templates: %v", err)
+		} else {
+			tmpls := strings.Fields(out)
+			for _, t := range tmpls {
+				klog.Infof("  > Deleting Template %s...", t)
+				if _, err := m.gce.Run(ctx, "compute", "instance-templates", "delete", t, "--quiet"); err != nil && !gce.IsNotFoundError(err) {
+					klog.Warningf("    ⚠️  Failed: %v", err)
+					errs = append(errs, fmt.Errorf("delete template %s: %w", t, err))
+				} else {
+					klog.Infof("    ✅ Done")
 				}
 			}
 		}
@@ -885,7 +940,8 @@ func (m *Manager) EnsureExternalAPIServer(ctx context.Context, cfg *config.Clust
 	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrBytes})
 
 	// 4. Sign CSR
-	certPEM, err := m.gce.SignCASCertificate(ctx, csrPEM, poolID, casRegion, caID)
+	// We need to use "gcloud privateca certificates create"
+	certPEM, err := m.gce.SignCASCertificate(ctx, csrPEM, poolID, casRegion, caID, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to sign certificate: %v", err)
 	}
@@ -912,6 +968,63 @@ func (m *Manager) EnsureExternalAPIServer(ctx context.Context, cfg *config.Clust
 	}
 	saPubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: saPubKeyBytes})
 
+	// 5.5 Front Proxy PKI
+	// 5.5.1 Generate Front Proxy CA (Delegated Intermediate)
+	fpCAKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate front-proxy ca key: %v", err)
+	}
+	fpCAKeyBytes := x509.MarshalPKCS1PrivateKey(fpCAKey)
+	fpCAKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: fpCAKeyBytes})
+
+	fpCATmpl := x509.CertificateRequest{
+		Subject: pkix.Name{CommonName: "front-proxy-ca"},
+	}
+	fpCACSRBytes, err := x509.CreateCertificateRequest(rand.Reader, &fpCATmpl, fpCAKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create front-proxy ca csr: %v", err)
+	}
+	fpCACSRPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: fpCACSRBytes})
+
+	// Sign Front Proxy CA with CAS (isCA=true)
+	fpCACertPEM, err := m.gce.SignCASCertificate(ctx, fpCACSRPEM, poolID, casRegion, caID, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sign front-proxy ca cert: %v", err)
+	}
+
+	// 5.5.2 Generate Front Proxy Client Cert (Signed by Local Front Proxy CA)
+	fpClientKey, fpClientCertPEM, err := m.generateSignedCert(fpCAKeyPEM, fpCACertPEM, "front-proxy-client", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate front-proxy client cert: %v", err)
+	}
+	// Decode Client Key for startup script (generateSignedCert returns PEM)
+	fpClientKeyPEM := fpClientKey
+
+	// 5.6 Cluster Signing CA (Local, for KCM CSR Signing)
+	// We generate this locally because KCM needs the private key to sign CSRs.
+	// CAS keys are not exportable.
+	signCAKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate signing ca key: %v", err)
+	}
+	signCAKeyBytes := x509.MarshalPKCS1PrivateKey(signCAKey)
+	signCAKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: signCAKeyBytes})
+
+	signCATmpl := x509.CertificateRequest{
+		Subject: pkix.Name{CommonName: "cluster-signing-ca"},
+	}
+	signCACSRBytes, err := x509.CreateCertificateRequest(rand.Reader, &signCATmpl, signCAKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create signing ca csr: %v", err)
+	}
+	signCACSRPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: signCACSRBytes})
+
+	// Sign Signing CA with CAS (isCA=true) -> Intermediate CA
+	signCACertPEM, err := m.gce.SignCASCertificate(ctx, signCACSRPEM, poolID, casRegion, caID, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to sign signing ca cert: %v", err)
+	}
+
 	// 6. Embed generic startup script
 	startupScript := `#! /bin/bash
 mkdir -p /var/lib/kingc/pki
@@ -927,13 +1040,20 @@ chmod 600 *
 	}
 
 	// Append to startup script to write certs and keys
+	// Note: We append signing-ca.crt to ca.crt (Trust Bundle)
+	// The API Server needs to trust certificates issued by this Signing CA.
 	startupScript += fmt.Sprintf(`
 echo "%s" > /var/lib/kingc/pki/apiserver.key
 echo "%s" > /var/lib/kingc/pki/apiserver.crt
-echo "%s" > /var/lib/kingc/pki/ca.crt
-echo "%s" > /var/lib/kingc/pki/sa.key
+echo "%s" > /var/lib/kingc/pki/run-ca.crt
+echo "%s" >> /var/lib/kingc/pki/run-ca.crt
+mv /var/lib/kingc/pki/run-ca.crt /var/lib/kingc/pki/ca.crt
 echo "%s" > /var/lib/kingc/pki/sa.pub
-`, string(keyPEM), string(certPEM), string(caPEM), string(saKeyPEM), string(saPubPEM))
+echo "%s" > /var/lib/kingc/pki/front-proxy-ca.key
+echo "%s" > /var/lib/kingc/pki/front-proxy-ca.crt
+echo "%s" > /var/lib/kingc/pki/front-proxy-client.crt
+echo "%s" > /var/lib/kingc/pki/front-proxy-client.key
+`, string(keyPEM), string(certPEM), string(caPEM), string(signCACertPEM), string(saPubPEM), string(fpCAKeyPEM), string(fpCACertPEM), string(fpClientCertPEM), string(fpClientKeyPEM))
 
 	args := []string{
 		"--secure-port=6443",
@@ -949,6 +1069,13 @@ echo "%s" > /var/lib/kingc/pki/sa.pub
 		"--allow-privileged=true",
 		"--enable-admission-plugins=NodeRestriction",
 		"--enable-bootstrap-token-auth=true",
+		"--requestheader-client-ca-file=/var/run/kubernetes/front-proxy-ca.crt",
+		"--requestheader-allowed-names=front-proxy-client",
+		"--requestheader-extra-headers-prefix=X-Remote-Extra-",
+		"--requestheader-group-headers=X-Remote-Group",
+		"--requestheader-username-headers=X-Remote-User",
+		"--proxy-client-cert-file=/var/run/kubernetes/front-proxy-client.crt",
+		"--proxy-client-key-file=/var/run/kubernetes/front-proxy-client.key",
 		"--v=2",
 	}
 
@@ -980,10 +1107,12 @@ echo "%s" > /var/lib/kingc/pki/sa.pub
 	}
 
 	return &ExternalAPIServerResult{
-		Endpoint: ip,
-		CACert:   caPEM,
-		SAKey:    saKeyPEM,
-		SAPub:    saPubPEM,
+		Endpoint:    ip,
+		CACert:      caPEM,
+		SigningKey:  signCAKeyPEM,
+		SigningCert: signCACertPEM,
+		SAKey:       saKeyPEM,
+		SAPub:       saPubPEM,
 	}, nil
 }
 
@@ -1015,7 +1144,8 @@ func (m *Manager) signKubeconfig(ctx context.Context, cfg *config.Cluster, cn st
 	caID := fmt.Sprintf("kingc-ca-%s", cfg.Metadata.Name)
 	casRegion := cfg.Spec.Region
 
-	certPEM, err := m.gce.SignCASCertificate(ctx, csrPEM, poolID, casRegion, caID)
+	// isCA=false for Client Certs
+	certPEM, err := m.gce.SignCASCertificate(ctx, csrPEM, poolID, casRegion, caID, false)
 	if err != nil {
 		return "", fmt.Errorf("sign certificate: %v", err)
 	}
@@ -1031,31 +1161,31 @@ func (m *Manager) signKubeconfig(ctx context.Context, cfg *config.Cluster, cn st
 	), nil
 }
 
-func (m *Manager) generateJoinCommand(ctx context.Context, kubeconfigPath, controlPlaneEndpoint string, caCert []byte) (string, error) {
+func (m *Manager) createBootstrapToken(ctx context.Context, kubeconfigPath string, caCert []byte) (token string, caHash string, err error) {
 	// 1. Calculate CA Cert Hash (Discovery Token CA Cert Hash)
 	// openssl x509 -in ca.crt -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256
 	// Go: sha256(SubjectPublicKeyInfo)
 	block, _ := pem.Decode(caCert)
 	if block == nil {
-		return "", fmt.Errorf("failed to decode CA cert PEM")
+		return "", "", fmt.Errorf("failed to decode CA cert PEM")
 	}
 	cert, err := x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse CA cert: %v", err)
+		return "", "", fmt.Errorf("failed to parse CA cert: %v", err)
 	}
 	pubKeyDer, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal public key: %v", err)
+		return "", "", fmt.Errorf("failed to marshal public key: %v", err)
 	}
 	hash := sha256.Sum256(pubKeyDer)
-	caHash := fmt.Sprintf("sha256:%s", hex.EncodeToString(hash[:]))
+	caHash = fmt.Sprintf("sha256:%s", hex.EncodeToString(hash[:]))
 
 	// 2. Create Bootstrap Token
 	// ID: 6 chars, Secret: 16 chars (hex/alphanum? [a-z0-9])
 	// kubeadm uses random lowercase alphanum
 	tokenID := randString(6)
 	tokenSecret := randString(16)
-	token := fmt.Sprintf("%s.%s", tokenID, tokenSecret)
+	token = fmt.Sprintf("%s.%s", tokenID, tokenSecret)
 
 	// Create Secret in kube-system
 	// We use text/template or just fmt.Sprintf for the Secret manifest
@@ -1079,17 +1209,15 @@ stringData:
 
 	tmpSecret := filepath.Join(filepath.Dir(kubeconfigPath), "bootstrap-token.yaml")
 	if err := os.WriteFile(tmpSecret, []byte(secretYAML), 0644); err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", kubeconfigPath, "apply", "-f", tmpSecret)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("failed to create bootstrap token: %v, out: %s", err, out)
+		return "", "", fmt.Errorf("failed to create bootstrap token: %v, out: %s", err, out)
 	}
 
-	// 3. Construct Join Command
-	// kubeadm join <endpoint> --token <token> --discovery-token-ca-cert-hash <hash>
-	return fmt.Sprintf("kubeadm join %s --token %s --discovery-token-ca-cert-hash %s", controlPlaneEndpoint, token, caHash), nil
+	return token, caHash, nil
 }
 
 func randString(n int) string {
@@ -1103,4 +1231,53 @@ func randString(n int) string {
 		b[i] = letters[int(b[i])%len(letters)]
 	}
 	return string(b)
+}
+
+func (m *Manager) generateSignedCert(caKeyPEM, caCertPEM []byte, cn string, orgs []string) (keyPEM, certPEM []byte, err error) {
+	// Parse CA
+	caBlock, _ := pem.Decode(caCertPEM)
+	if caBlock == nil {
+		return nil, nil, fmt.Errorf("failed to decode ca cert")
+	}
+	caCert, err := x509.ParseCertificate(caBlock.Bytes)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse ca cert: %v", err)
+	}
+	caKeyBlock, _ := pem.Decode(caKeyPEM)
+	if caKeyBlock == nil {
+		return nil, nil, fmt.Errorf("failed to decode ca key")
+	}
+	caKey, err := x509.ParsePKCS1PrivateKey(caKeyBlock.Bytes)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse ca key: %v", err)
+	}
+
+	// Generate Key
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, nil, fmt.Errorf("generate key: %v", err)
+	}
+	keyBytes := x509.MarshalPKCS1PrivateKey(key)
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: keyBytes})
+
+	// Cert Template
+	tmpl := x509.Certificate{
+		SerialNumber: big.NewInt(2), // Randomize?
+		Subject: pkix.Name{
+			CommonName:   cn,
+			Organization: orgs,
+		},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(1 * 365 * 24 * time.Hour), // 1 year
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+	}
+
+	certBytes, err := x509.CreateCertificate(rand.Reader, &tmpl, caCert, &key.PublicKey, caKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create cert: %v", err)
+	}
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certBytes})
+	return keyPEM, certPEM, nil
 }
