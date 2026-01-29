@@ -317,15 +317,13 @@ echo "👑 kingc: Running Kubeadm Init Phases..."
 kubeadm init phase control-plane controller-manager --config /etc/kubernetes/kubeadm-config.yaml
 kubeadm init phase control-plane scheduler --config /etc/kubernetes/kubeadm-config.yaml
 kubeadm init phase kubelet-start --config /etc/kubernetes/kubeadm-config.yaml
-# need to wait for the apiserver to be ready
-kubeadm init phase wait-control-plane 
 
 kubeadm init phase bootstrap-token --config /etc/kubernetes/kubeadm-config.yaml
 kubeadm init phase upload-config all --config /etc/kubernetes/kubeadm-config.yaml
 
-kubeadm init phase mark-control-plane --config /etc/kubernetes/kubeadm-config.yaml
 kubeadm init phase addon all --config /etc/kubernetes/kubeadm-config.yaml
 kubeadm init phase kubelet-finalize all --config /etc/kubernetes/kubeadm-config.yaml
+kubeadm init phase mark-control-plane --config /etc/kubernetes/kubeadm-config.yaml
 
 echo "👑 kingc: Control Plane Bootstrapped"
 `, baseInstallScript, string(caCert), string(saPub), string(signingKey), string(signingCert),
