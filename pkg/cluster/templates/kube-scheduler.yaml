@@ -9,6 +9,7 @@ metadata:
 spec:
   priorityClassName: system-node-critical
   hostNetwork: true
+  automountServiceAccountToken: false
   containers:
   - name: kube-scheduler
     image: registry.k8s.io/kube-scheduler:{{ .KubernetesVersion }}

@@ -9,6 +9,7 @@ metadata:
 spec:
   priorityClassName: system-node-critical
   hostNetwork: true
+  automountServiceAccountToken: false
   containers:
   - name: kube-controller-manager
     image: registry.k8s.io/kube-controller-manager:{{ .KubernetesVersion }}
