@@ -283,22 +283,6 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 		}
 	}
 
-	// 4.5 Render Control Plane Manifests (Scheduler, Controller Manager)
-	// We deploy them as Static Pods on the Control Plane node.
-	// This avoids dependency on the API server during bootstrap.
-	schedManifest, err := m.renderTemplate("templates/kube-scheduler.yaml", templateData)
-	if err != nil {
-		return err
-	}
-	cmManifest, err := m.renderTemplate("templates/kube-controller-manager.yaml", templateData)
-	if err != nil {
-		return err
-	}
-
-	// Construct the CP startup script
-	// We run kubeadm join (worker mode) but with CP labels/taints
-	kubeadmArgs := "--ignore-preflight-errors=NumCPU"
-
 	cpStartupScript := fmt.Sprintf(`%s
 
 # ---------------------------------------------------------
@@ -306,8 +290,11 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 # ---------------------------------------------------------
 echo "👑 kingc: Writing PKI files (SA Keys & Signing CA)..."
 mkdir -p /etc/kubernetes/pki
-# CA Cert will be fetched by kubeadm join.
-# However, SA keys are NOT fetched by worker join, so we MUST provide them for CM.
+# We must provide ca.crt for kubeadm init to use our external CA.
+echo "%s" > /etc/kubernetes/pki/ca.crt
+# TODO(aojea): This is needed to avoid to fail kubeadm init validation
+# for external CA names
+touch /etc/kubernetes/pki/ca.key
 echo "%s" > /etc/kubernetes/pki/sa.pub
 
 # Signing CA for KCM (CSR Signing)
@@ -319,31 +306,30 @@ echo "%s" > /etc/kubernetes/admin.conf
 echo "%s" > /etc/kubernetes/scheduler.conf
 echo "%s" > /etc/kubernetes/controller-manager.conf
 
-echo "👑 kingc: Writing Static Pod Manifests..."
-mkdir -p /etc/kubernetes/manifests
-cat <<EOF > /etc/kubernetes/manifests/kube-scheduler.yaml
-%s
-EOF
-
-cat <<EOF > /etc/kubernetes/manifests/kube-controller-manager.yaml
-%s
-EOF
-
 echo "👑 kingc: Writing kubeadm config..."
 mkdir -p /etc/kubernetes
 cat <<EOF > /etc/kubernetes/kubeadm-config.yaml
 %s
 EOF
 
-ARGS="%s"
-echo "👑 kingc: Joining Control Plane Node..."
-kubeadm join --config /etc/kubernetes/kubeadm-config.yaml $ARGS
+echo "👑 kingc: Running Kubeadm Init Phases..."
+# Write controller-manager and scheduler manifests
+kubeadm init phase control-plane controller-manager --config /etc/kubernetes/kubeadm-config.yaml
+kubeadm init phase control-plane scheduler --config /etc/kubernetes/kubeadm-config.yaml
+kubeadm init phase kubelet-start --config /etc/kubernetes/kubeadm-config.yaml
+# need to wait for the apiserver to be ready
 
-echo "👑 kingc: Control Plane Joined"
-`, baseInstallScript, string(saPub), string(signingKey), string(signingCert),
+kubeadm init phase bootstrap-token --config /etc/kubernetes/kubeadm-config.yaml
+kubeadm init phase upload-config all --config /etc/kubernetes/kubeadm-config.yaml
+# mark-control-plane
+kubeadm init phase mark-control-plane --config /etc/kubernetes/kubeadm-config.yaml
+kubeadm init phase addon all --config /etc/kubernetes/kubeadm-config.yaml
+kubeadm init phase kubelet-finalize all --config /etc/kubernetes/kubeadm-config.yaml
+
+echo "👑 kingc: Control Plane Bootstrapped"
+`, baseInstallScript, string(caCert), string(saPub), string(signingKey), string(signingCert),
 		templateData["Kubeconfig"], templateData["SchedulerKubeconfig"], templateData["ControllerManagerKubeconfig"],
-		schedManifest, cmManifest,
-		kubeadmConfig, kubeadmArgs)
+		kubeadmConfig)
 
 	tmpCPStartup := filepath.Join(tmpDir, "cp-startup.sh")
 	if err := os.WriteFile(tmpCPStartup, []byte(cpStartupScript), 0644); err != nil {
