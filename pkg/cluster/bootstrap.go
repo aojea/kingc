@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -30,6 +31,11 @@ func CreateBootstrapResources(ctx context.Context, client kubernetes.Interface, 
 	// 2. Create/Update cluster-info ConfigMap
 	if err := createClusterInfo(ctx, client, tokenID, token, caCert, endpoint); err != nil {
 		return fmt.Errorf("failed to create cluster-info: %v", err)
+	}
+
+	// 3. Create RBAC Roles/Bindings for Bootstrapping
+	if err := CreateBootstrapRBAC(ctx, client); err != nil {
+		return fmt.Errorf("failed to create bootstrap rbac: %v", err)
 	}
 
 	return nil
@@ -159,4 +165,84 @@ func computeJWS(payload, secret string) (string, error) {
 	// It stores the FULL JWS string.
 
 	return b64Header + "." + b64Payload + "." + b64Signature, nil
+}
+
+// CreateBootstrapRBAC creates the necessary ClusterRoles and Bindings for kubelet bootstrapping.
+func CreateBootstrapRBAC(ctx context.Context, client kubernetes.Interface) error {
+	groupName := "system:bootstrappers:kubeadm:default-node-token"
+
+	// 1. ClusterRoleBinding: Allow bootstrapping (CSR creation)
+	// Binds group to system:node-bootstrapper
+	crbBootstrap := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "kingc:kubelet-bootstrap"},
+		Subjects: []rbacv1.Subject{
+			{Kind: "Group", Name: groupName, APIGroup: "rbac.authorization.k8s.io"},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "system:node-bootstrapper",
+		},
+	}
+	if _, err := client.RbacV1().ClusterRoleBindings().Create(ctx, crbBootstrap, metav1.CreateOptions{}); err != nil {
+		if !strings.Contains(err.Error(), "already exists") {
+			return err
+		}
+	}
+
+	// 2. ClusterRoleBinding: Auto-approve node client CSRs
+	// Binds group to system:certificates.k8s.io:certificatesigningrequests:nodeclient
+	crbAutoApprove := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "kingc:node-autoapprove-bootstrap"},
+		Subjects: []rbacv1.Subject{
+			{Kind: "Group", Name: groupName, APIGroup: "rbac.authorization.k8s.io"},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "system:certificates.k8s.io:certificatesigningrequests:nodeclient",
+		},
+	}
+	if _, err := client.RbacV1().ClusterRoleBindings().Create(ctx, crbAutoApprove, metav1.CreateOptions{}); err != nil {
+		if !strings.Contains(err.Error(), "already exists") {
+			return err
+		}
+	}
+
+	// 3. ClusterRole + Binding: Allow getting nodes (kubeadm pre-check)
+	// Some versions of kubeadm/kubelet check if the node exists.
+	roleGetNodes := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{Name: "kingc:get-nodes"},
+		Rules: []rbacv1.PolicyRule{
+			{
+				Verbs:     []string{"get", "list", "watch"},
+				APIGroups: []string{""},
+				Resources: []string{"nodes"},
+			},
+		},
+	}
+	if _, err := client.RbacV1().ClusterRoles().Create(ctx, roleGetNodes, metav1.CreateOptions{}); err != nil {
+		if !strings.Contains(err.Error(), "already exists") {
+			return err
+		}
+	}
+
+	crbGetNodes := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "kingc:get-nodes"},
+		Subjects: []rbacv1.Subject{
+			{Kind: "Group", Name: groupName, APIGroup: "rbac.authorization.k8s.io"},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "kingc:get-nodes",
+		},
+	}
+	if _, err := client.RbacV1().ClusterRoleBindings().Create(ctx, crbGetNodes, metav1.CreateOptions{}); err != nil {
+		if !strings.Contains(err.Error(), "already exists") {
+			return err
+		}
+	}
+
+	return nil
 }
