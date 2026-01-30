@@ -312,8 +312,3 @@ spec:
         resources:
           requests:
             cpu: "200m"
-        env:
-        - name: KUBERNETES_SERVICE_HOST
-          value: "127.0.0.1"
-        - name: KUBERNETES_SERVICE_PORT
-          value: "6443"
