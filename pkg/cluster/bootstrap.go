@@ -244,5 +244,47 @@ func CreateBootstrapRBAC(ctx context.Context, client kubernetes.Interface) error
 		}
 	}
 
+	// 4. Role + RoleBinding: Allow anonymous access to cluster-info in kube-public
+	// Required for discovery phase
+	roleClusterInfo := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kingc:bootstrap-signer-clusterinfo",
+			Namespace: metav1.NamespacePublic,
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				Verbs:         []string{"get"},
+				APIGroups:     []string{""},
+				Resources:     []string{"configmaps"},
+				ResourceNames: []string{"cluster-info"},
+			},
+		},
+	}
+	if _, err := client.RbacV1().Roles(metav1.NamespacePublic).Create(ctx, roleClusterInfo, metav1.CreateOptions{}); err != nil {
+		if !strings.Contains(err.Error(), "already exists") {
+			return err
+		}
+	}
+
+	rbClusterInfo := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kingc:bootstrap-signer-clusterinfo",
+			Namespace: metav1.NamespacePublic,
+		},
+		Subjects: []rbacv1.Subject{
+			{Kind: "User", Name: "system:anonymous", APIGroup: "rbac.authorization.k8s.io"},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     "kingc:bootstrap-signer-clusterinfo",
+		},
+	}
+	if _, err := client.RbacV1().RoleBindings(metav1.NamespacePublic).Create(ctx, rbClusterInfo, metav1.CreateOptions{}); err != nil {
+		if !strings.Contains(err.Error(), "already exists") {
+			return err
+		}
+	}
+
 	return nil
 }
