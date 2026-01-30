@@ -11,7 +11,7 @@ import (
 )
 
 func TestCreateBootstrapResources(t *testing.T) {
-	client := fake.NewSimpleClientset()
+	client := fake.NewSimpleClientset() //nolint:staticcheck
 	token := "abcdef.0123456789abcdef"
 	caCert := []byte("fake-ca-cert")
 	endpoint := "https://127.0.0.1:6443"
