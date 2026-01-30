@@ -45,6 +45,14 @@ type Spec struct {
 type Kubernetes struct {
 	Version    string               `yaml:"version"`
 	Networking KubernetesNetworking `yaml:"networking"`
+	OIDC       *OIDC                `yaml:"oidc"`
+}
+
+type OIDC struct {
+	ClientID      string `yaml:"clientID"`
+	IssuerURL     string `yaml:"issuerURL"`
+	UsernameClaim string `yaml:"usernameClaim"`
+	GroupsClaim   string `yaml:"groupsClaim"`
 }
 
 type KubernetesNetworking struct {

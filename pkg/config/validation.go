@@ -23,6 +23,10 @@ func (c *Cluster) Validate() error {
 		}
 	}
 
+	if err := c.validateOIDC(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -74,6 +78,23 @@ func (c *Cluster) validateNodeGroup(name string, ng NodeGroup) error {
 		if !foundCompatibleSubnet {
 			return fmt.Errorf("node group '%s' is in region '%s', but no subnets are defined for that region", name, ng.Region)
 		}
+	}
+	return nil
+}
+
+func (c *Cluster) validateOIDC() error {
+	oidc := c.Spec.Kubernetes.OIDC
+	if oidc == nil {
+		return nil
+	}
+	if oidc.ClientID == "" {
+		return fmt.Errorf("oidc.clientID is required")
+	}
+	if oidc.IssuerURL == "" {
+		return fmt.Errorf("oidc.issuerURL is required")
+	}
+	if oidc.UsernameClaim == "" {
+		return fmt.Errorf("oidc.usernameClaim is required")
 	}
 	return nil
 }
