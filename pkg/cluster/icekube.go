@@ -111,6 +111,17 @@ func (m *Manager) EnsureExternalAPIServer(ctx context.Context, cfg *config.Clust
 	if err != nil {
 		return nil, fmt.Errorf("parse cluster ca cert: %v", err)
 	}
+	// Fetch Root CA for trust bundle
+	rootCAPEM, err := m.gce.GetCASRootCertificate(ctx, poolID, casRegion, caID)
+	if err != nil {
+		klog.Warningf("failed to fetch root ca: %v", err)
+		// Fallback to just intermediate if fail? Or error?
+		// generic error might block if perms missing, but we just created it.
+		// Let's error.
+		return nil, fmt.Errorf("fetch root ca: %v", err)
+	}
+	// Trust Bundle: Intermediate + Root
+	trustBundlePEM := append(clusterCACertPEM, rootCAPEM...)
 
 	// 3.2 Node CA (Intermediate, Persistent Key)
 	nodeCAKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -232,7 +243,8 @@ func (m *Manager) EnsureExternalAPIServer(ctx context.Context, cfg *config.Clust
 	if err != nil {
 		return nil, fmt.Errorf("sign admin cert: %v", err)
 	}
-	adminKC := config.GenerateKubeconfig(cfg.Metadata.Name, fmt.Sprintf("https://%s:6443", ip), "kubernetes-admin", clusterCACertPEM, adminClientCertPEM, adminClientKeyPEM)
+	adminKC := config.GenerateKubeconfig(cfg.Metadata.Name, fmt.Sprintf("https://%s", net.JoinHostPort(ip, "6443")),
+		"kubernetes-admin", trustBundlePEM, adminClientCertPEM, adminClientKeyPEM)
 
 	// 6.2 Scheduler
 	schedKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -244,7 +256,8 @@ func (m *Manager) EnsureExternalAPIServer(ctx context.Context, cfg *config.Clust
 	if err != nil {
 		return nil, fmt.Errorf("sign scheduler cert: %v", err)
 	}
-	schedKC := config.GenerateKubeconfig(cfg.Metadata.Name, fmt.Sprintf("https://%s:6443", ip), "system:kube-scheduler", clusterCACertPEM, schedCertPEM, schedKeyPEM)
+	schedKC := config.GenerateKubeconfig(cfg.Metadata.Name, fmt.Sprintf("https://%s", net.JoinHostPort(ip, "6443")),
+		"system:kube-scheduler", trustBundlePEM, schedCertPEM, schedKeyPEM)
 
 	// 6.3 Controller Manager
 	cmKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -256,7 +269,8 @@ func (m *Manager) EnsureExternalAPIServer(ctx context.Context, cfg *config.Clust
 	if err != nil {
 		return nil, fmt.Errorf("sign cm cert: %v", err)
 	}
-	cmKC := config.GenerateKubeconfig(cfg.Metadata.Name, fmt.Sprintf("https://%s:6443", ip), "system:kube-controller-manager", clusterCACertPEM, cmCertPEM, cmKeyPEM)
+	cmKC := config.GenerateKubeconfig(cfg.Metadata.Name, fmt.Sprintf("https://%s", net.JoinHostPort(ip, "6443")),
+		"system:kube-controller-manager", trustBundlePEM, cmCertPEM, cmKeyPEM)
 
 	// 7. Embed startup script
 	startupScript := `#! /bin/bash
@@ -350,8 +364,8 @@ echo "%s" > /var/lib/kingc/pki/front-proxy-client.key
 
 	return &ExternalAPIServerResult{
 		Endpoint: ip,
-		// Bundle: Cluster CA + Node CA Bundle (for trust)
-		CACert:                      append(clusterCACertPEM, nodeCACertPEM...),
+		// Bundle: Trust Bundle (Cluster+Root) + Node CA
+		CACert:                      append(trustBundlePEM, nodeCACertPEM...),
 		SigningKey:                  nodeCAKeyPEM,
 		SigningCert:                 nodeCALeafPEM, // Single Cert for KCM
 		SAKey:                       saKeyPEM,
