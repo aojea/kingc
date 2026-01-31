@@ -1,0 +1,95 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bootstrap-token-{{ .TokenID }}
+  namespace: kube-system
+type: bootstrap.kubernetes.io/token
+stringData:
+  token-id: "{{ .TokenID }}"
+  token-secret: "{{ .TokenSecret }}"
+  usage-bootstrap-authentication: "true"
+  usage-bootstrap-signing: "true"
+  auth-extra-groups: "system:bootstrappers:kubeadm:default-node-token"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-info
+  namespace: kube-public
+data:
+  kubeconfig: |
+{{ .Kubeconfig | indent 4 }}
+  jws-kubeconfig-{{ .TokenID }}: "{{ .JWSSignature }}"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kingc:kubelet-bootstrap
+subjects:
+- kind: Group
+  name: system:bootstrappers:kubeadm:default-node-token
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:node-bootstrapper
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kingc:node-autoapprove-bootstrap
+subjects:
+- kind: Group
+  name: system:bootstrappers:kubeadm:default-node-token
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:certificates.k8s.io:certificatesigningrequests:nodeclient
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kingc:get-nodes
+rules:
+- verbs: ["get", "list", "watch"]
+  apiGroups: [""]
+  resources: ["nodes"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kingc:get-nodes
+subjects:
+- kind: Group
+  name: system:bootstrappers:kubeadm:default-node-token
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kingc:get-nodes
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kingc:bootstrap-signer-clusterinfo
+  namespace: kube-public
+rules:
+- verbs: ["get"]
+  apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["cluster-info"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kingc:bootstrap-signer-clusterinfo
+  namespace: kube-public
+subjects:
+- kind: User
+  name: system:anonymous
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kingc:bootstrap-signer-clusterinfo
