@@ -427,14 +427,41 @@ func (c *Client) CreateContainerInstance(
 		args = append(args, fmt.Sprintf("--container-arg=%s", arg))
 	}
 
-	if len(metadata) > 0 {
-		var metaList []string
-		for k, v := range metadata {
-			// If v is a file path? Gcloud supports key=value or key=file
-			// Assuming key=value or key=file passed directly as string
-			metaList = append(metaList, fmt.Sprintf("%s=%s", k, v))
+	var metadataList []string
+	var metadataFromFileList []string
+
+	for k, v := range metadata {
+		// If the value is a multiline script (like startup-script), we MUST use --metadata-from-file
+		// to avoid quoting issues with gcloud dict parsing.
+		// For simplicity, let's write it to a temp file if it looks like a script/content
+		// OR just assume 'startup-script' always goes to file.
+		if k == "startup-script" {
+			tmpScript, err := os.CreateTemp("", "kingc-startup-*.sh")
+			if err != nil {
+				return fmt.Errorf("failed to create temp startup script: %v", err)
+			}
+			// We won't defer remove here because gcloud command needs it.
+			// But we should cleanup after Run.
+			defer func() {
+				_ = os.Remove(tmpScript.Name())
+			}()
+
+			if _, err := tmpScript.WriteString(v); err != nil {
+				return err
+			}
+			_ = tmpScript.Close()
+			metadataFromFileList = append(metadataFromFileList, fmt.Sprintf("%s=%s", k, tmpScript.Name()))
+		} else {
+			// Normal metadata
+			metadataList = append(metadataList, fmt.Sprintf("%s=%s", k, v))
 		}
-		args = append(args, "--metadata", strings.Join(metaList, ","))
+	}
+
+	if len(metadataList) > 0 {
+		args = append(args, "--metadata", strings.Join(metadataList, ","))
+	}
+	if len(metadataFromFileList) > 0 {
+		args = append(args, "--metadata-from-file", strings.Join(metadataFromFileList, ","))
 	}
 
 	// We might need --metadata-from-file if the value is a file path
