@@ -75,7 +75,7 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 	// Cleanup temp dir unless retained (useful for debugging generated scripts)
 	defer func() {
 		if !retain {
-			os.RemoveAll(tmpDir)
+			_ = os.RemoveAll(tmpDir)
 		} else {
 			klog.Infof("⚠️  Retaining temporary files in %s", tmpDir)
 		}
@@ -337,7 +337,9 @@ echo "👑 kingc: Control Plane Initialized"
 			klog.Infof("    - Installing Cloud Provider GCP...")
 
 			tmpCCM := filepath.Join(tmpDir, "ccm.yaml")
-			os.WriteFile(tmpCCM, []byte(ccmManifest), 0644)
+			if err := os.WriteFile(tmpCCM, []byte(ccmManifest), 0644); err != nil {
+				return err
+			}
 
 			cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", localKubeconfig, "apply", "-f", tmpCCM)
 			if out, err := cmd.CombinedOutput(); err != nil {

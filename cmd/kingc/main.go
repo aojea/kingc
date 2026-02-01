@@ -103,17 +103,17 @@ func init() {
 		quiet, _ := cmd.Flags().GetBool("quiet")
 		if quiet {
 			// Suppress klog output
-			flag.Set("logtostderr", "false")
-			flag.Set("stderrthreshold", "FATAL")
+			_ = flag.Set("logtostderr", "false")
+			_ = flag.Set("stderrthreshold", "FATAL")
 		} else {
 			// Map verbosity to klog level
 			switch verbosityFlag {
 			case VerbosityDebug:
-				flag.Set("v", "6")
+				_ = flag.Set("v", "6")
 			case VerbosityInfo, VerbosityNone:
-				flag.Set("v", "0")
+				_ = flag.Set("v", "0")
 			case VerbosityWarning, VerbosityError, VerbosityCritical:
-				flag.Set("v", "2")
+				_ = flag.Set("v", "2")
 			}
 		}
 	}
@@ -215,15 +215,19 @@ Powershell:
 	ValidArgs:             []string{"bash", "zsh", "fish", "powershell"},
 	Args:                  cobra.MatchAll(cobra.ExactArgs(1), cobra.OnlyValidArgs),
 	Run: func(cmd *cobra.Command, args []string) {
+		var err error
 		switch args[0] {
 		case "bash":
-			cmd.Root().GenBashCompletion(os.Stdout)
+			err = cmd.Root().GenBashCompletion(os.Stdout)
 		case "zsh":
-			cmd.Root().GenZshCompletion(os.Stdout)
+			err = cmd.Root().GenZshCompletion(os.Stdout)
 		case "fish":
-			cmd.Root().GenFishCompletion(os.Stdout, true)
+			err = cmd.Root().GenFishCompletion(os.Stdout, true)
 		case "powershell":
-			cmd.Root().GenPowerShellCompletionWithDesc(os.Stdout)
+			err = cmd.Root().GenPowerShellCompletionWithDesc(os.Stdout)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error generating completion: %v\n", err)
 		}
 	},
 }
