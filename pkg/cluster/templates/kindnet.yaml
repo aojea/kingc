@@ -3,6 +3,7 @@ kind: ClusterRole
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: kindnet
+  namespace: kube-system
 rules:
   - apiGroups:
       - ""
@@ -12,13 +13,6 @@ rules:
       - list
       - watch
       - patch
-  - apiGroups:
-      - ""
-    resources:
-      - nodes/proxy
-      - nodes/configz
-    verbs:
-      - get
   - apiGroups:
       - ""
     resources:
@@ -100,7 +94,7 @@ spec:
         - --hostname-override=$(NODE_NAME)
         - --network-policy=true
         - --masquerading=true
-        - --dns-caching=true
+        - --dns-caching=false
         - --disable-cni=false
         - --fastpath-threshold=20
         - --ipsec-overlay=false
