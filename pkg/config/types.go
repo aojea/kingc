@@ -104,7 +104,7 @@ func Default() *Cluster {
 
 	c.Spec.WorkerGroups = []NodeGroup{{
 		Name:        DefaultWorkerGroupName,
-		Replicas:    DefaultReplicas,
+		Replicas:    DefaultWorkerReplicas,
 		MachineType: DefaultWorkerMachineType,
 		DiskSizeGB:  DefaultDiskSizeGB,
 	}}

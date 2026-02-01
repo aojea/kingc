@@ -14,7 +14,7 @@ const (
 	DefaultControlPlaneMachineType = "n1-standard-2"
 	DefaultWorkerMachineType       = "n1-standard-2"
 	DefaultDiskSizeGB              = 50
-	DefaultReplicas                = 2
+	DefaultWorkerReplicas          = 2
 
 	DefaultNetworkName = "kingc-net"
 	DefaultSubnetName  = "kingc-subnet"
