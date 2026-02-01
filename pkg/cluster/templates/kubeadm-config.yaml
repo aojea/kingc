@@ -1,4 +1,39 @@
 apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: "{{ .ControlPlaneIP }}"
+  bindPort: 6443
+nodeRegistration:
+  criSocket: "unix:///var/run/containerd/containerd.sock"
+  imagePullPolicy: IfNotPresent
+  kubeletExtraArgs:
+    # Cloud Provider External
+    cloud-provider: "external"
+skipPhases:
+- preflight
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: "{{ .KubernetesVersion }}"
+controlPlaneEndpoint: "{{ .ControlPlaneEndpoint }}"
+apiServer:
+  certSANs:
+  - "{{ .ControlPlaneIP }}"
+  - localhost
+  - 127.0.0.1
+  extraArgs:
+    runtime-config: "{{ .RuntimeConfig }}"
+controllerManager:
+  extraArgs:
+    cloud-provider: "external"
+scheduler:
+  extraArgs:
+networking:
+  dnsDomain: cluster.local
+  podSubnet: "{{ .PodSubnet }}"
+  serviceSubnet: "{{ .ServiceSubnet }}"
+---
+apiVersion: kubeadm.k8s.io/v1beta3
 kind: JoinConfiguration
 discovery:
   bootstrapToken:
@@ -8,9 +43,20 @@ discovery:
     - "{{ .DiscoveryTokenCaCertHash }}"
 nodeRegistration:
   kubeletExtraArgs:
-    node-labels: "node-role.kubernetes.io/control-plane="
     # Cloud Provider External
     cloud-provider: "external"
-  taints:
-  - key: "node-role.kubernetes.io/control-plane"
-    effect: "NoSchedule"
+skipPhases:
+- preflight
+---
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+conntrack:
+  maxPerCore: 0
+iptables:
+  minSyncPeriod: 1s
+kind: KubeProxyConfiguration
+mode: nftables
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+cgroupDriver: systemd
+failSwapOn: false
+kind: KubeletConfiguration
