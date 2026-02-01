@@ -206,13 +206,13 @@ func (c *Client) CreateSubnet(ctx context.Context, name, network, region, rangeC
 	return err
 }
 
-func (c *Client) CreateFirewallRules(ctx context.Context, clusterName, network string) error {
-	if _, err := c.Run(ctx, "compute", "firewall-rules", "create", clusterName+"-internal",
+func (c *Client) CreateFirewallRules(ctx context.Context, name, network string) error {
+	if _, err := c.Run(ctx, "compute", "firewall-rules", "create", name+"-internal",
 		"--network", network, "--allow", "tcp,udp,icmp", "--source-ranges", "10.0.0.0/8,192.168.0.0/16,172.16.0.0/12"); err != nil && !IsAlreadyExistsError(err) {
 		return err
 	}
 
-	if _, err := c.Run(ctx, "compute", "firewall-rules", "create", clusterName+"-external",
+	if _, err := c.Run(ctx, "compute", "firewall-rules", "create", name+"-external",
 		"--network", network, "--allow", "tcp:22,tcp:6443", "--source-ranges", "0.0.0.0/0"); err != nil && !IsAlreadyExistsError(err) {
 		return err
 	}

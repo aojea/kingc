@@ -88,9 +88,9 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 						return err
 					}
 				}
-				if err := m.gce.CreateFirewallRules(ctx, cfg.Metadata.Name, netName); err != nil {
-					return err
-				}
+			}
+			if err := m.gce.CreateFirewallRules(ctx, basename(cfg.Metadata.Name), netName); err != nil {
+				return err
 			}
 		}
 	}
@@ -569,7 +569,9 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 	{
 		defer m.measure("Firewall Rules Cleanup")()
 		klog.Infof("  > Deleting Firewall Rules...")
-		rules := []string{name + "-internal", name + "-external"}
+		// Use basename for firewall rules as they are created with it
+		baseName := basename(name)
+		rules := []string{baseName + "-internal", baseName + "-external"}
 		fwArgs := append([]string{"compute", "firewall-rules", "delete"}, rules...)
 		fwArgs = append(fwArgs, "--quiet")
 		if _, err := m.gce.Run(ctx, fwArgs...); err != nil && !gce.IsNotFoundError(err) {
