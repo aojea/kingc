@@ -400,18 +400,19 @@ echo "👑 kingc: Control Plane Bootstrapped"
 		defer m.measure("Worker Groups Provisioning")()
 		klog.Infof("  > Provisioning Worker Groups...")
 
-		// Generate Join Command locally (reusing existing token info)
-		// joinCommand is like "kubeadm join host:port --token ... --discovery-token-ca-cert-hash ..."
-		joinCommand := fmt.Sprintf("kubeadm join %s --token %s --discovery-token-ca-cert-hash %s", cfg.Spec.ExternalAPIServer.Host, bootstrapToken, caHash)
-
 		workerStartup := fmt.Sprintf(`%s
 
 # ---------------------------------------------------------
 # Worker Bootstrap
 # ---------------------------------------------------------
+echo "👑 kingc: Writing kubeadm config..."
+mkdir -p /etc/kubernetes
+cat <<EOF > /etc/kubernetes/kubeadm-config.yaml
+%s
+EOF
 echo "👑 kingc: Joining cluster..."
-%s --ignore-preflight-errors=NumCPU
-`, baseInstallScript, joinCommand)
+kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-errors=NumCPU
+`, baseInstallScript, kubeadmConfig)
 
 		tmpWorkerStartup := filepath.Join(tmpDir, "worker-startup.sh")
 		if err := os.WriteFile(tmpWorkerStartup, []byte(workerStartup), 0644); err != nil {
