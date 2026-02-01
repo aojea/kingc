@@ -148,8 +148,10 @@ echo "👑 kingc: Control Plane Initialized"
 `, baseInstallScript, kubeadmConfig)
 
 	tmpCPStartup, _ := os.CreateTemp("", "cp-startup-*.sh")
-	os.WriteFile(tmpCPStartup.Name(), []byte(cpStartupScript), 0644)
-	defer os.Remove(tmpCPStartup.Name())
+	if err := os.WriteFile(tmpCPStartup.Name(), []byte(cpStartupScript), 0644); err != nil {
+		return fmt.Errorf("failed to write startup script: %v", err)
+	}
+	defer func() { _ = os.Remove(tmpCPStartup.Name()) }()
 
 	// 5. Provision Control Plane
 	if len(cfg.Spec.Networks) == 0 {
@@ -276,8 +278,10 @@ echo "👑 kingc: Joining cluster..."
 `, baseInstallScript, joinCommand)
 
 	tmpWorkerStartup, _ := os.CreateTemp("", "worker-startup-*.sh")
-	os.WriteFile(tmpWorkerStartup.Name(), []byte(workerStartup), 0644)
-	defer os.Remove(tmpWorkerStartup.Name())
+	if err := os.WriteFile(tmpWorkerStartup.Name(), []byte(workerStartup), 0644); err != nil {
+		return fmt.Errorf("failed to write worker startup script: %v", err)
+	}
+	defer func() { _ = os.Remove(tmpWorkerStartup.Name()) }()
 
 	for _, grp := range cfg.Spec.WorkerGroups {
 		klog.Infof("    [%s] Creating Instance Template and MIG (%d replicas) in %s...", grp.Name, grp.Replicas, grp.Zone)
@@ -322,8 +326,13 @@ echo "👑 kingc: Joining cluster..."
 	// 8. Fetch Kubeconfig
 	klog.Infof("  > Fetching admin.conf...")
 	localKubeconfig := fmt.Sprintf("%s.conf", cfg.Metadata.Name)
-	m.gce.SSH(cpName, cpZone, "sudo cp /etc/kubernetes/admin.conf ~/admin.conf && sudo chown $(whoami) ~/admin.conf")
-	m.gce.SCP(fmt.Sprintf("%s:~/admin.conf", cpName), localKubeconfig, cpZone)
+	// We should check error here
+	if err := m.gce.SSH(cpName, cpZone, "sudo cp /etc/kubernetes/admin.conf ~/admin.conf && sudo chown $(whoami) ~/admin.conf"); err != nil {
+		klog.Warningf("    (SSH warning: %v)", err)
+	}
+	if err := m.gce.SCP(fmt.Sprintf("%s:~/admin.conf", cpName), localKubeconfig, cpZone); err != nil {
+		klog.Warningf("    (SCP warning: %v)", err)
+	}
 
 	klog.Infof("✅ Cluster ready! Kubeconfig at: ./%s", localKubeconfig)
 	return nil
@@ -368,7 +377,7 @@ func (m *Manager) Delete(name string) error {
 
 	for _, inst := range instances {
 		klog.Infof("  > Deleting instance %s in %s...\n", inst.Name, inst.Zone)
-		m.gce.Run("compute", "instances", "delete", inst.Name, "--zone", inst.Zone, "--quiet")
+		_, _ = m.gce.Run("compute", "instances", "delete", inst.Name, "--zone", inst.Zone, "--quiet")
 	}
 
 	// 3. Delete Regional LB Resources (Best Effort)
@@ -422,10 +431,8 @@ func (m *Manager) Delete(name string) error {
 	}
 
 	for zone := range zones {
-		if err := m.gce.DeleteUnmanagedInstanceGroup(baseName+"-cp-ig", zone); err != nil {
-			// This will fail for zones without the IG
-			// klog.Warningf("    (IG cleanup warning in %s: %v)\n", zone, err)
-		}
+		// Best effort delete of IG in all zones where instances were found
+		_ = m.gce.DeleteUnmanagedInstanceGroup(baseName+"-cp-ig", zone)
 	}
 
 	// 4. Delete Addresses (Strictly <cluster>-api)
@@ -466,7 +473,7 @@ func (m *Manager) waitForAPIServer(ip string, timeout time.Duration) error {
 
 		resp, err := client.Get(url)
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				return nil
 			}
