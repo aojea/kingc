@@ -34,6 +34,8 @@ apiServer:
 controllerManager:
   extraArgs:
     cloud-provider: "external"
+    cluster-signing-cert-file: "/etc/kubernetes/pki/node-ca.crt"
+    cluster-signing-key-file: "/etc/kubernetes/pki/node-ca.key"
 scheduler:
   extraArgs:
 networking:
