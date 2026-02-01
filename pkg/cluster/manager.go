@@ -115,7 +115,7 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 	}
 
 	// 1. Networking
-	{
+	if err := func() error {
 		defer m.measure("Networking Setup")()
 		for _, net := range cfg.Spec.Networks {
 			netName := net.Name
@@ -137,6 +137,9 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 				return err
 			}
 		}
+		return nil
+	}(); err != nil {
+		return err
 	}
 
 	// 1.5 Ensure External APIServer (New Architecture)
@@ -144,7 +147,7 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 	var localKubeconfig string
 	var adminKubeconfig, schedulerKubeconfig, cmKubeconfig string
 
-	{
+	if err := func() error {
 		defer m.measure("Ensure External APIServer")()
 
 		if len(cfg.Spec.Networks) == 0 {
@@ -202,18 +205,24 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 		signingKey = res.SigningKey
 		signingCert = res.SigningCert
 		frontProxyCACert = res.FrontProxyCACert
+		return nil
+	}(); err != nil {
+		return err
 	}
 
 	// 2. Load Balancer / Endpoint
 	klog.Infof("  > Using External APIServer at %s", cfg.Spec.ExternalAPIServer.String())
 	// 6. Wait for Control Plane Ready
-	{
+	if err := func() error {
 		defer m.measure("Wait for API Server")()
 		klog.Infof("  > Waiting for Kubernetes API Server (%s) to be ready...", cfg.Spec.ExternalAPIServer.String())
 		timeout := 5 * time.Minute
 		if err := m.waitForAPIServer(ctx, cfg.Spec.ExternalAPIServer, timeout); err != nil {
 			return fmt.Errorf("control plane failed to initialize after %v: %v", timeout, err)
 		}
+		return nil
+	}(); err != nil {
+		return err
 	}
 
 	// 3. Prepare Base Scripts (Pass Version info)
@@ -537,7 +546,7 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 	var errs []error
 
 	// Delete Instance Groups
-	{
+	if err := func() error {
 		defer m.measure("Instance Groups Cleanup")()
 		klog.Infof("  > Cleaning up Instance Groups...")
 		filter := fmt.Sprintf("name:%s*", name)
@@ -566,10 +575,13 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 				}
 			}
 		}
+		return nil
+	}(); err != nil {
+		// do not fail on delete
 	}
 
 	// Delete Instance Templates
-	{
+	if err := func() error {
 		defer m.measure("Instance Templates Cleanup")()
 		klog.Infof("  > Cleaning up Instance Templates...")
 		filter := fmt.Sprintf("name:%s*", name)
@@ -589,10 +601,13 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 				}
 			}
 		}
+		return nil
+	}(); err != nil {
+		// do not fail on delete
 	}
 
 	// Delete Remaining Instances
-	{
+	if err := func() error {
 		defer m.measure("Instances Cleanup")()
 		// We also verify instances to find regions if address is missing
 		tags := []string{basename(name)}
@@ -601,6 +616,7 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 			klog.Warningf("    ⚠️  Failed to list instances: %v", err)
 		} else {
 			for _, inst := range instances {
+
 				klog.Infof("  > Deleting Instance %s in %s...", inst.Name, inst.Zone)
 				if _, err := m.gce.Run(ctx, "compute", "instances", "delete", inst.Name, "--zone", inst.Zone, "--quiet"); err != nil && !gce.IsNotFoundError(err) {
 					klog.Warningf("    ⚠️  Failed: %v", err)
@@ -610,11 +626,14 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 				}
 			}
 		}
+		return nil
+	}(); err != nil {
+		// do not fail on delete
 	}
 
 	// Delete Firewall Rules
 	// Check if rules exist by trying to delete them and ignoring NotFound
-	{
+	if err := func() error {
 		defer m.measure("Firewall Rules Cleanup")()
 		klog.Infof("  > Deleting Firewall Rules...")
 		// Use basename for firewall rules as they are created with it
@@ -628,6 +647,8 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 		} else {
 			klog.Infof("    ✅ Done")
 		}
+		return nil
+	}(); err != nil {
 	}
 
 	if len(errs) > 0 {
