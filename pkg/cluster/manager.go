@@ -283,6 +283,18 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 		}
 	}
 
+	// 4.5 Render Control Plane Manifests (Scheduler, Controller Manager)
+	// We deploy them as Static Pods on the Control Plane node.
+	// This avoids dependency on the API server during bootstrap.
+	schedManifest, err := m.renderTemplate("templates/kube-scheduler.yaml", templateData)
+	if err != nil {
+		return err
+	}
+	cmManifest, err := m.renderTemplate("templates/kube-controller-manager.yaml", templateData)
+	if err != nil {
+		return err
+	}
+
 	// Construct the CP startup script
 	// We run kubeadm join (worker mode) but with CP labels/taints
 	kubeadmArgs := "--ignore-preflight-errors=NumCPU"
@@ -294,7 +306,7 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 # ---------------------------------------------------------
 echo "👑 kingc: Writing PKI files (SA Keys & Signing CA)..."
 mkdir -p /etc/kubernetes/pki
-# CA Cert will be fetched by kubeadm join, but we can pre-populate if we want.
+# CA Cert will be fetched by kubeadm join.
 # However, SA keys are NOT fetched by worker join, so we MUST provide them for CM.
 echo "%s" > /etc/kubernetes/pki/sa.pub
 
@@ -307,6 +319,16 @@ echo "%s" > /etc/kubernetes/admin.conf
 echo "%s" > /etc/kubernetes/scheduler.conf
 echo "%s" > /etc/kubernetes/controller-manager.conf
 
+echo "👑 kingc: Writing Static Pod Manifests..."
+mkdir -p /etc/kubernetes/manifests
+cat <<EOF > /etc/kubernetes/manifests/kube-scheduler.yaml
+%s
+EOF
+
+cat <<EOF > /etc/kubernetes/manifests/kube-controller-manager.yaml
+%s
+EOF
+
 echo "👑 kingc: Writing kubeadm config..."
 mkdir -p /etc/kubernetes
 cat <<EOF > /etc/kubernetes/kubeadm-config.yaml
@@ -318,34 +340,14 @@ echo "👑 kingc: Joining Control Plane Node..."
 kubeadm join --config /etc/kubernetes/kubeadm-config.yaml $ARGS
 
 echo "👑 kingc: Control Plane Joined"
-`, baseInstallScript, string(saPub), string(signingKey), string(signingCert), templateData["Kubeconfig"], templateData["SchedulerKubeconfig"], templateData["ControllerManagerKubeconfig"], kubeadmConfig, kubeadmArgs)
+`, baseInstallScript, string(saPub), string(signingKey), string(signingCert),
+		templateData["Kubeconfig"], templateData["SchedulerKubeconfig"], templateData["ControllerManagerKubeconfig"],
+		schedManifest, cmManifest,
+		kubeadmConfig, kubeadmArgs)
 
 	tmpCPStartup := filepath.Join(tmpDir, "cp-startup.sh")
 	if err := os.WriteFile(tmpCPStartup, []byte(cpStartupScript), 0644); err != nil {
 		return fmt.Errorf("failed to write startup script: %v", err)
-	}
-
-	// 4.5 Apply Control Plane Manifests (Scheduler, Controller Manager)
-	{
-		defer m.measure("Apply CP Manifests")()
-		klog.Infof("  > Applying Control Plane Manifests...")
-
-		manifests := []string{"kube-scheduler.yaml", "kube-controller-manager.yaml"}
-		for _, man := range manifests {
-			out, err := m.renderTemplate("templates/"+man, templateData)
-			if err != nil {
-				return err
-			}
-			tmpMan := filepath.Join(tmpDir, man)
-			if err := os.WriteFile(tmpMan, []byte(out), 0644); err != nil {
-				return err
-			}
-			cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", localKubeconfig, "apply", "-f", tmpMan)
-			if out, err := cmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("failed to apply %s: %v, output: %s", man, err, out)
-			}
-			klog.Infof("    ✅ Applied %s", man)
-		}
 	}
 
 	// 5. Provision Control Plane
