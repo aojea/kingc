@@ -330,6 +330,17 @@ echo "%s" > /var/lib/kingc/pki/front-proxy-client.key
 		"--v=2",
 	}
 
+	if cfg.Spec.Kubernetes.OIDC != nil {
+		args = append(args,
+			"--oidc-issuer-url="+cfg.Spec.Kubernetes.OIDC.IssuerURL,
+			"--oidc-client-id="+cfg.Spec.Kubernetes.OIDC.ClientID,
+			"--oidc-username-claim="+cfg.Spec.Kubernetes.OIDC.UsernameClaim,
+		)
+		if cfg.Spec.Kubernetes.OIDC.GroupsClaim != "" {
+			args = append(args, "--oidc-groups-claim="+cfg.Spec.Kubernetes.OIDC.GroupsClaim)
+		}
+	}
+
 	meta := map[string]string{
 		"startup-script": startupScript,
 	}
