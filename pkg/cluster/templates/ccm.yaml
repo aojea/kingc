@@ -295,11 +295,7 @@ spec:
       nodeSelector:
         node-role.kubernetes.io/control-plane: ""
       tolerations:
-      - key: node.kubernetes.io/not-ready
-        effect: NoSchedule
-      - key: node-role.kubernetes.io/master
-        effect: NoSchedule
-      - key: node-role.kubernetes.io/control-plane
+      - operator: Exists
         effect: NoSchedule
       containers:
       - name: cloud-controller-manager
@@ -309,8 +305,8 @@ spec:
         - --cloud-provider=gce
         - --leader-elect=true
         - --use-service-account-credentials
-        - --configure-cloud-routes=no
-        - --allocate-node-cidrs=yes
+        - --configure-cloud-routes=false
+        - --allocate-node-cidrs=true
         - --cluster-cidr={{ .PodSubnet }}
         - --v=2
         resources:
