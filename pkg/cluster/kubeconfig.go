@@ -108,3 +108,26 @@ func mergeKubeconfig(clusterName string, newConfigData []byte) error {
 	klog.Infof("✅ Kubeconfig merged. Switched context to %q.", uniqueContextName)
 	return nil
 }
+
+// CreateBootstrapKubeconfig creates a kubeconfig used for TLS bootstrapping (token-based).
+func CreateBootstrapKubeconfig(clusterName, endpoint string, caCert []byte, token string) ([]byte, error) {
+	config := api.NewConfig()
+
+	cluster := api.NewCluster()
+	cluster.Server = endpoint
+	cluster.CertificateAuthorityData = caCert
+	config.Clusters[clusterName] = cluster
+
+	authInfo := api.NewAuthInfo()
+	authInfo.Token = token
+	userName := "tls-bootstrap-token-user"
+	config.AuthInfos[userName] = authInfo
+
+	context := api.NewContext()
+	context.Cluster = clusterName
+	context.AuthInfo = userName
+	config.Contexts[clusterName] = context
+	config.CurrentContext = clusterName
+
+	return clientcmd.Write(*config)
+}

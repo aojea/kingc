@@ -273,6 +273,11 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 		templateData["DiscoveryTokenCaCertHash"] = caHash
 	}
 
+	bootstrapKubeconfig, err := CreateBootstrapKubeconfig(cfg.Metadata.Name, cfg.Spec.ExternalAPIServer.String(), caCert, bootstrapToken)
+	if err != nil {
+		return fmt.Errorf("create bootstrap kubeconfig: %v", err)
+	}
+
 	// 4. Prepare Control Plane Config & Script
 	klog.Infof("  > Generating Kubeadm Join config for Control Plane...")
 	// We use JoinConfiguration now
@@ -316,6 +321,7 @@ echo "👑 kingc: Writing Kubeconfigs..."
 echo "%s" > /etc/kubernetes/admin.conf
 echo "%s" > /etc/kubernetes/scheduler.conf
 echo "%s" > /etc/kubernetes/controller-manager.conf
+echo "%s" > /etc/kubernetes/bootstrap-kubelet.conf
 
 echo "👑 kingc: Writing kubeadm config..."
 mkdir -p /etc/kubernetes
@@ -327,10 +333,11 @@ echo "👑 kingc: Running Kubeadm Init Phases..."
 # Write controller-manager and scheduler manifests
 kubeadm init phase control-plane controller-manager --config /etc/kubernetes/kubeadm-config.yaml
 kubeadm init phase control-plane scheduler --config /etc/kubernetes/kubeadm-config.yaml
-kubeadm init phase kubelet-start --config /etc/kubernetes/kubeadm-config.yaml
 
 kubeadm init phase bootstrap-token --config /etc/kubernetes/kubeadm-config.yaml
 kubeadm init phase upload-config all --config /etc/kubernetes/kubeadm-config.yaml
+
+kubeadm init phase kubelet-start --config /etc/kubernetes/kubeadm-config.yaml
 
 kubeadm init phase addon all --config /etc/kubernetes/kubeadm-config.yaml
 kubeadm init phase kubelet-finalize all --config /etc/kubernetes/kubeadm-config.yaml
@@ -339,7 +346,7 @@ kubeadm init phase mark-control-plane --config /etc/kubernetes/kubeadm-config.ya
 echo "👑 kingc: Control Plane Bootstrapped"
 `, baseInstallScript, string(caCert), string(saPub), string(saKey), string(signingCert), string(signingKey), string(frontProxyCACert),
 		templateData["Kubeconfig"], templateData["SchedulerKubeconfig"], templateData["ControllerManagerKubeconfig"],
-		kubeadmConfig)
+		string(bootstrapKubeconfig), kubeadmConfig)
 
 	tmpCPStartup := filepath.Join(tmpDir, "cp-startup.sh")
 	if err := os.WriteFile(tmpCPStartup, []byte(cpStartupScript), 0644); err != nil {
