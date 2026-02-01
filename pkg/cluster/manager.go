@@ -119,12 +119,21 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 		firstRC = false
 	}
 
+	// Calculate Repo Version (Major.Minor) from KubernetesVersion (Major.Minor.Patch)
+	// e.g. v1.30.0 -> v1.30
+	repoVer := cfg.Spec.KubernetesVersion
+	parts := strings.Split(repoVer, ".")
+	if len(parts) >= 2 {
+		repoVer = strings.Join(parts[:2], ".")
+	}
+
 	templateData := map[string]interface{}{
-		"ClusterName":          cfg.Metadata.Name,
-		"ControlPlaneEndpoint": lbIP,
-		"KubernetesVersion":    cfg.Spec.KubernetesVersion,
-		"FeatureGates":         cfg.Spec.FeatureGates,
-		"RuntimeConfig":        rcBuilder.String(),
+		"ClusterName":           cfg.Metadata.Name,
+		"ControlPlaneEndpoint":  lbIP,
+		"KubernetesVersion":     cfg.Spec.KubernetesVersion,
+		"KubernetesRepoVersion": repoVer,
+		"FeatureGates":          cfg.Spec.FeatureGates,
+		"RuntimeConfig":         rcBuilder.String(),
 	}
 
 	// Render the base installation script
