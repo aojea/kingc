@@ -413,18 +413,23 @@ echo "👑 kingc: Joining cluster..."
 		}
 	}
 
-	// 10. Finalize (Export Kubeconfig)
-	finalKubeconfig := fmt.Sprintf("%s.conf", cfg.Metadata.Name)
-	// Read from temp and write to CWD
+	// 10. Finalize (Merge Kubeconfig)
+	// Read from temp and merge into KUBECONFIG
 	kcBytes, err := os.ReadFile(localKubeconfig)
 	if err == nil {
-		if err := os.WriteFile(finalKubeconfig, kcBytes, 0600); err != nil {
-			klog.Warningf("⚠️  Failed to write final kubeconfig to ./%s: %v", finalKubeconfig, err)
-		} else {
-			klog.Infof("✅ Cluster ready! Kubeconfig available at: ./%s", finalKubeconfig)
+		if err := mergeKubeconfig(cfg.Metadata.Name, kcBytes); err != nil {
+			klog.Warningf("⚠️  Failed to merge kubeconfig: %v", err)
+			// Fallback: write local file if merge fails?
+			// Or just let user rely on the one in temp dir if they used --retain?
+			// The temp dir is deleted by default.
+			// Let's at least try to save it locally as fallback.
+			fallbackConfig := fmt.Sprintf("%s.conf", cfg.Metadata.Name)
+			if wErr := os.WriteFile(fallbackConfig, kcBytes, 0600); wErr == nil {
+				klog.Infof("    Saved config to ./%s", fallbackConfig)
+			}
 		}
 	} else {
-		klog.Warningf("⚠️  Could not read temporary kubeconfig to export: %v", err)
+		klog.Warningf("⚠️  Could not read temporary kubeconfig for merging: %v", err)
 	}
 
 	return nil
