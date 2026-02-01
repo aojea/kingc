@@ -167,28 +167,13 @@ echo "👑 kingc: Control Plane Initialized"
 	cpZone := cfg.Spec.ControlPlane.Zone
 	cpName := fmt.Sprintf("%s-cp", cfg.Metadata.Name)
 
-	// Regional External LB logic:
-	// IP is NOT attached to instance directly. It is attached to Forwarding Rule.
-	// Instance needs NO public IP? Or logic says "If false (default), a regional external IP is attached directly".
-	// But User said "Regional External Passthrough Network Load Balancer by default".
-	// In Passthrough LB, the packets arrive with destination IP = LB IP.
-	// The instance must accept packets for that IP.
-	// Kubeadm/Kubelet binding?
-	// Usually invalid for standard VM unless we configure "IP forwarding" or "Alias IP" or "Netplan".
-	// OR we just use it as "ControlPlaneEndpoint" in kubeadm and the VM listens on 0.0.0.0.
 	// GCP External Passthrough LB delivers packets to the VM.
-	// Code update: Do NOT attach lbIP to CreateInstance.
-
 	klog.Infof("  > Provisioning Control Plane VM (%s)...", cpZone)
 	err = m.gce.CreateInstance(
 		cpName, cpZone, cfg.Spec.ControlPlane.MachineType,
 		cpNet, cpSub,
 		config.DefaultImageFamily, "", tmpCPStartup.Name(),
-		"", // No static IP attached directly (Ephemeral public IP is default if not specified? Or none?)
-		// CreateInstance implementation: if address is "", it doesn't pass --address.
-		// gcloud default is Ephemeral External IP unless --no-address is passed.
-		// We probably want Ephemeral External IP for outbound access? Or NAT.
-		// For MVP, Ephemeral is fine.
+		"",
 		[]string{
 			"kingc-cluster-" + cfg.Metadata.Name,
 			"kingc-role-control-plane",
