@@ -329,7 +329,7 @@ func (c *Client) DeleteCASPool(ctx context.Context, poolID, region string) error
 	return err
 }
 
-func (c *Client) SignCASCertificate(ctx context.Context, csrPEM []byte, pool, location, caName string) ([]byte, error) {
+func (c *Client) SignCASCertificate(ctx context.Context, csrPEM []byte, pool, location, caName string, isCA bool) ([]byte, error) {
 	tmpCsr, err := os.CreateTemp("", "kingc-csr-*.pem")
 	if err != nil {
 		return nil, err
@@ -362,6 +362,12 @@ func (c *Client) SignCASCertificate(ctx context.Context, csrPEM []byte, pool, lo
 	}
 	if caName != "" {
 		args = append(args, "--ca", caName)
+	}
+	if isCA {
+		args = append(args,
+			"--is-ca-cert",
+			"--use-preset-profile=subordinate_mtls_path_len_0",
+		)
 	}
 
 	if _, err := c.Run(ctx, args...); err != nil {

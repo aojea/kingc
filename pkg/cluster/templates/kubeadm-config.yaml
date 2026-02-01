@@ -1,33 +1,16 @@
 apiVersion: kubeadm.k8s.io/v1beta3
-kind: InitConfiguration
+kind: JoinConfiguration
+discovery:
+  bootstrapToken:
+    apiServerEndpoint: "{{ .ControlPlaneEndpoint }}"
+    token: "{{ .BootstrapToken }}"
+    caCertHashes:
+    - "{{ .DiscoveryTokenCaCertHash }}"
 nodeRegistration:
   kubeletExtraArgs:
+    node-labels: "node-role.kubernetes.io/control-plane="
+    # Cloud Provider External
     cloud-provider: "external"
----
-apiVersion: kubeadm.k8s.io/v1beta3
-kind: ClusterConfiguration
-clusterName: {{ .ClusterName }}
-kubernetesVersion: {{ .KubernetesVersion }}
-controlPlaneEndpoint: "{{ .ControlPlaneEndpoint }}"
-networking:
-  podSubnet: "{{ .PodSubnet }}"
-  serviceSubnet: "{{ .ServiceSubnet }}"
-  dnsDomain: "cluster.local"
-featureGates:
-{{- range $key, $val := .FeatureGates }}
-  {{ $key }}: {{ $val }}
-{{- end }}
-apiServer:
-  certSANs:
-    - "{{ .ControlPlaneIP }}"
-    - "127.0.0.1"
-  extraArgs:
-    authorization-mode: "Node,RBAC"
-    {{- if .RuntimeConfig }}
-    runtime-config: "{{ .RuntimeConfig }}"
-    {{- end }}
-controllerManager:
-  extraArgs:
-    cloud-provider: "external"
-scheduler:
-  extraArgs:
+  taints:
+  - key: "node-role.kubernetes.io/control-plane"
+    effect: "NoSchedule"
