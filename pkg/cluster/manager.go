@@ -941,13 +941,15 @@ echo "%s" > /var/lib/kingc/pki/sa.pub
 		"--service-account-key-file=/var/run/kubernetes/sa.pub",
 		"--service-account-signing-key-file=/var/run/kubernetes/sa.key",
 		"--service-account-issuer=https://kubernetes.default.svc.cluster.local",
-		"--token-auth-file=/var/run/kubernetes/tokens.csv",
 		"--authorization-mode=Node,RBAC",
 		"--advertise-address=" + ip,
 		"--tls-cert-file=/var/run/kubernetes/apiserver.crt",
 		"--tls-private-key-file=/var/run/kubernetes/apiserver.key",
 		"--client-ca-file=/var/run/kubernetes/ca.crt",
 		"--allow-privileged=true",
+		"--enable-admission-plugins=NodeRestriction",
+		"--enable-bootstrap-token-auth=true",
+		"--v=2",
 	}
 
 	meta := map[string]string{
