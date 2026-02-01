@@ -340,6 +340,41 @@ func (c *Client) RunSSHOutput(ctx context.Context, instance, zone, command strin
 	return "", fmt.Errorf("ssh command failed (default: %v) (bypass: %v)", err, err2)
 }
 
+func (c *Client) RunSSHRaw(ctx context.Context, instance, zone string, cmd []string) ([]byte, error) {
+	runRaw := func(args ...string) ([]byte, error) {
+		klog.V(4).Infof("Running (raw): gcloud %s", strings.Join(args, " "))
+		cCmd := exec.CommandContext(ctx, "gcloud", args...)
+		// Capture stderr if verbose
+		if c.Verbosity != "" && c.Verbosity != "none" {
+			cCmd.Stderr = os.Stderr
+		}
+		return cCmd.Output()
+	}
+
+	// Attempt 1
+	args := []string{"compute", "ssh", instance, "--zone", zone}
+	if len(cmd) > 0 {
+		args = append(args, "--command", strings.Join(cmd, " "))
+	}
+	out, err := runRaw(args...)
+	if err == nil {
+		return out, nil
+	}
+
+	// Attempt 2
+	klog.V(2).Infof("RunSSHRaw attempt 1 to %s failed (%v), retrying with -F /dev/null", instance, err)
+	argsRetry := []string{"compute", "ssh", instance, "--zone", zone, "--ssh-flag=-F /dev/null"}
+	if len(cmd) > 0 {
+		argsRetry = append(argsRetry, "--command", strings.Join(cmd, " "))
+	}
+	out2, err2 := runRaw(argsRetry...)
+	if err2 == nil {
+		klog.Warningf("SSH command to %s succeeded only after bypassing local SSH config (-F /dev/null).", instance)
+		return out2, nil
+	}
+	return nil, fmt.Errorf("ssh raw command failed: %v (bypass attempt: %v)", err, err2)
+}
+
 func (c *Client) SCP(ctx context.Context, localPath, remotePath, zone string) error {
 	cmd := exec.CommandContext(ctx, "gcloud", "compute", "scp", localPath, remotePath, "--zone", zone)
 	return cmd.Run()

@@ -1,11 +1,14 @@
 package cluster
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"embed"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -741,23 +744,90 @@ func (m *Manager) ExportLogs(ctx context.Context, clusterName, outDir string) er
 
 	var errs []error
 	for _, node := range nodes {
-		// Capture logs (services + pods)
 		klog.Infof("  Retrieving logs from %s...", node.Name)
-		// We use sh -c to simple command chaining and redirection under sudo
-		cmd := `sudo sh -c "journalctl -u google-startup-scripts -u kubelet -u containerd --no-pager > /tmp/kingc-services.log && tar czf - /tmp/kingc-services.log /var/log/pods /var/log/containers"`
-		out, err := m.gce.RunSSHOutput(ctx, node.Name, node.Zone, cmd)
+		// Capture logs (services + pods)
+		cmd := `sudo sh -c "mkdir -p /tmp/kingc-logs && ` +
+			`journalctl -u kubeblock -u kubelet -u containerd -u google-startup-scripts --no-pager > /tmp/kingc-logs/extensions.log && ` +
+			`cp /var/log/kubelet.log /tmp/kingc-logs/kubelet.log 2>/dev/null || true && ` +
+			`tar czf - -C /tmp/kingc-logs . -C /var/log pods containers"`
+
+		out, err := m.gce.RunSSHRaw(ctx, node.Name, node.Zone, []string{cmd})
 		if err != nil {
-			klog.Warningf("  ⚠️ Failed to get logs from %s: %v", node.Name, err)
+			klog.Warningf("  ⚠️  Failed to get logs from %s: %v", node.Name, err)
 			errs = append(errs, err)
 			continue
 		}
-		fName := fmt.Sprintf("%s/%s.tar.gz", outDir, node.Name)
-		if err := os.WriteFile(fName, []byte(out), 0644); err != nil {
+
+		// stream untar
+		nodeDir := filepath.Join(outDir, node.Name)
+		if err := os.MkdirAll(nodeDir, 0755); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		if err := untar(nodeDir, bytes.NewReader(out)); err != nil {
+			klog.Warningf("  ⚠️  Failed to extract logs for %s: %v", node.Name, err)
 			errs = append(errs, err)
 		}
 	}
+
 	if len(errs) > 0 {
 		return fmt.Errorf("encountered %d errors collecting logs", len(errs))
 	}
 	return nil
+}
+
+func untar(dst string, r io.Reader) error {
+	gzr, err := gzip.NewReader(r)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = gzr.Close()
+	}()
+
+	tr := tar.NewReader(gzr)
+
+	for {
+		header, err := tr.Next()
+		switch {
+		case err == io.EOF:
+			return nil
+		case err != nil:
+			return err
+		case header == nil:
+			continue
+		}
+
+		target := filepath.Join(dst, header.Name)
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if _, err := os.Stat(target); err != nil {
+				if err := os.MkdirAll(target, 0755); err != nil {
+					return err
+				}
+			}
+		case tar.TypeReg:
+			f, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
+			if err != nil {
+				// Try creating dir if missing (sometimes tar entries order varies)
+				if os.IsNotExist(err) {
+					if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+						return err
+					}
+					f, err = os.OpenFile(target, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
+					if err != nil {
+						return err
+					}
+				} else {
+					return err
+				}
+			}
+			if _, err := io.Copy(f, tr); err != nil {
+				_ = f.Close()
+				return err
+			}
+			_ = f.Close()
+		}
+	}
 }
