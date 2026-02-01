@@ -95,7 +95,7 @@ func init() {
 	// Root flags
 	rootCmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
 	rootCmd.PersistentFlags().BoolP("quiet", "q", false, "silence all stderr output")
-	rootCmd.PersistentFlags().StringP("verbosity", "v", "warning", "gcloud verbosity level (debug, info, warning, error, critical, none)")
+	rootCmd.PersistentFlags().VarP(&verbosityFlag, "verbosity", "v", "gcloud verbosity level (debug, info, warning, error, critical, none)")
 	rootCmd.PersistentFlags().Bool("no-user-output-enabled", false, "suppress command output to standard output and standard error (gcloud)")
 
 	rootCmd.PersistentPreRun = func(cmd *cobra.Command, args []string) {
@@ -104,6 +104,16 @@ func init() {
 			// Suppress klog output
 			flag.Set("logtostderr", "false")
 			flag.Set("stderrthreshold", "FATAL")
+		} else {
+			// Map verbosity to klog level
+			switch verbosityFlag {
+			case VerbosityDebug:
+				flag.Set("v", "6")
+			case VerbosityInfo, VerbosityNone:
+				flag.Set("v", "0")
+			case VerbosityWarning, VerbosityError, VerbosityCritical:
+				flag.Set("v", "2")
+			}
 		}
 	}
 
@@ -142,6 +152,38 @@ func init() {
 	// Export Logs Flags
 	exportLogsCmd.Flags().String("name", "kingc", "Cluster name")
 }
+
+// VerbosityLevel is a custom flag type for validation
+type VerbosityLevel string
+
+const (
+	VerbosityDebug    VerbosityLevel = "debug"
+	VerbosityInfo     VerbosityLevel = "info"
+	VerbosityWarning  VerbosityLevel = "warning"
+	VerbosityError    VerbosityLevel = "error"
+	VerbosityCritical VerbosityLevel = "critical"
+	VerbosityNone     VerbosityLevel = "none"
+)
+
+func (v *VerbosityLevel) String() string {
+	return string(*v)
+}
+
+func (v *VerbosityLevel) Set(value string) error {
+	switch value {
+	case "debug", "info", "warning", "error", "critical", "none":
+		*v = VerbosityLevel(value)
+		return nil
+	default:
+		return fmt.Errorf("invalid verbosity level %q, allowed: debug, info, warning, error, critical, none", value)
+	}
+}
+
+func (v *VerbosityLevel) Type() string {
+	return "level"
+}
+
+var verbosityFlag = VerbosityWarning
 
 var completionCmd = &cobra.Command{
 	Use:   "completion [bash|zsh|fish|powershell]",
@@ -187,7 +229,8 @@ Powershell:
 
 func main() {
 	klog.InitFlags(nil)
-	_ = flag.CommandLine.Set("logtostderr", "true")
+	// Default to logging to stderr
+	_ = flag.Set("logtostderr", "true")
 
 	// Create context that cancels on SIGINT or SIGTERM
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -200,12 +243,11 @@ func main() {
 }
 
 func getClient(cmd *cobra.Command) *gce.Client {
-	verbosity, _ := cmd.Flags().GetString("verbosity")
 	quiet, _ := cmd.Flags().GetBool("quiet")
 	noUserOutput, _ := cmd.Flags().GetBool("no-user-output-enabled")
 
 	return gce.NewClient(
-		gce.WithVerbosity(verbosity),
+		gce.WithVerbosity(verbosityFlag.String()),
 		gce.WithQuiet(quiet),
 		gce.WithNoUserOutput(noUserOutput),
 	)
