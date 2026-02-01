@@ -135,7 +135,8 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 		"KubernetesRepoVersion": repoVer,
 		"PodSubnet":             cfg.Spec.Kubernetes.Networking.PodCIDR,
 		"ServiceSubnet":         cfg.Spec.Kubernetes.Networking.ServiceCIDR,
-		"KindnetVersion":        "v1.0.0", // TODO: Make configurable if needed
+		"KindnetImage":          "registry.k8s.io/networking/kindnet:v1.0.0",
+		"CCMImage":              "registry.k8s.io/cloud-provider-gcp/cloud-controller-manager:v35.0.0",
 		"FeatureGates":          cfg.Spec.FeatureGates,
 		"RuntimeConfig":         rcBuilder.String(),
 	}
@@ -298,7 +299,10 @@ echo "👑 kingc: Control Plane Initialized"
 
 			klog.Infof("    - Installing kindnet (v%s)...", "1.0.0") // Hardcoded for now or use variable
 
-			tmpKindnet, _ := os.CreateTemp("", "kindnet-*.yaml")
+			tmpKindnet, err := os.CreateTemp("", "kindnet-*.yaml")
+			if err != nil {
+				return fmt.Errorf("failed to create temp file: %v", err)
+			}
 			err = os.WriteFile(tmpKindnet.Name(), []byte(kindnetManifest), 0644)
 			if err != nil {
 				return fmt.Errorf("failed to write kindnet manifest to %s: %v", tmpKindnet.Name(), err)
@@ -316,14 +320,25 @@ echo "👑 kingc: Control Plane Initialized"
 		}
 
 		// B. Cloud Controller Manager (external)
-		// https://github.com/kubernetes/cloud-provider-gcp/blob/master/deploy/packages/default/manifest.yaml
-		// Raw: https://raw.githubusercontent.com/kubernetes/cloud-provider-gcp/master/deploy/packages/default/manifest.yaml
-		ccmURI := "https://raw.githubusercontent.com/kubernetes/cloud-provider-gcp/master/deploy/packages/default/manifest.yaml"
-		klog.Infof("    - Installing Cloud Provider GCP...")
-		cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", localKubeconfig, "apply", "-f", ccmURI)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			// This might fail if network is restricted or URL is wrong.
-			klog.Warningf("    ⚠️  Failed to install CCM (might need manual install): %v\nOutput: %s", err, out)
+		{
+			ccmManifest, err := m.renderTemplate("templates/ccm.yaml", templateData)
+			if err != nil {
+				return err
+			}
+
+			klog.Infof("    - Installing Cloud Provider GCP...")
+
+			tmpCCM, err := os.CreateTemp("", "ccm-*.yaml")
+			if err != nil {
+				return fmt.Errorf("failed to create temp file: %v", err)
+			}
+			os.WriteFile(tmpCCM.Name(), []byte(ccmManifest), 0644)
+			defer os.Remove(tmpCCM.Name())
+
+			cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", localKubeconfig, "apply", "-f", tmpCCM.Name())
+			if out, err := cmd.CombinedOutput(); err != nil {
+				klog.Warningf("    ⚠️  Failed to install CCM: %v\nOutput: %s", err, out)
+			}
 		}
 	}
 
@@ -397,20 +412,6 @@ echo "👑 kingc: Joining cluster..."
 			}
 		}
 	}
-
-	// 9. Workers are next (Wait for them to join?)
-	// Actually we provision workers after addons? Or before?
-	// Existing code had workers after addons in block 7, but fetching kubeconfig was block 8 (after workers).
-	// We moved fetch to 7, addons to 8. So workers should be 9.
-	// WAIT, original code:
-	// 5. Provision CP
-	// 6. Wait for API
-	// 7. Addons
-	// 7b (was 7 too in comments). Worker Pools.
-	// 8. Fetch Kubeconfig.
-
-	// We want: 5 -> 6 -> Fetch (was 8) -> Addons (New) -> Workers (was 7b).
-	// So we just need to ensure Workers block is after our new Addons block.
 
 	return nil
 }
