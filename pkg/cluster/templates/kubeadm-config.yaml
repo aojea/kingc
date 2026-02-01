@@ -1,0 +1,32 @@
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+nodeRegistration:
+  kubeletExtraArgs:
+    cloud-provider: "external"
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+clusterName: {{ .ClusterName }}
+kubernetesVersion: {{ .KubernetesVersion }}
+controlPlaneEndpoint: "{{ .ControlPlaneEndpoint }}:6443"
+networking:
+  podSubnet: "192.168.0.0/16"
+  serviceSubnet: "10.96.0.0/12"
+  dnsDomain: "cluster.local"
+featureGates:
+{{- range $key, $val := .FeatureGates }}
+  {{ $key }}: {{ $val }}
+{{- end }}
+apiServer:
+  certSANs:
+    - "{{ .ControlPlaneEndpoint }}"
+    - "127.0.0.1"
+  extraArgs:
+    authorization-mode: "Node,RBAC"
+    {{- if .RuntimeConfig }}
+    runtime-config: "{{ .RuntimeConfig }}"
+    {{- end }}
+controllerManager:
+  extraArgs:
+    cloud-provider: "external"
+scheduler: {}
