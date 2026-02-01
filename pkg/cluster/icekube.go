@@ -350,6 +350,7 @@ echo "%s" > /var/lib/kingc/pki/front-proxy-client.key
 		SigningCert:                 nodeCACertPEM,
 		SAKey:                       saKeyPEM,
 		SAPub:                       saPubPEM,
+		FrontProxyCACert:            fpCACertPEM,
 		AdminKubeconfig:             adminKC,
 		SchedulerKubeconfig:         schedKC,
 		ControllerManagerKubeconfig: cmKC,
