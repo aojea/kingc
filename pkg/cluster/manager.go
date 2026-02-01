@@ -718,15 +718,17 @@ func (m *Manager) ExportLogs(ctx context.Context, clusterName, outDir string) er
 
 	var errs []error
 	for _, node := range nodes {
-		// Capture startup script logs
+		// Capture logs (services + pods)
 		klog.Infof("  Retrieving logs from %s...", node.Name)
-		out, err := m.gce.RunSSHOutput(ctx, node.Name, node.Zone, "sudo journalctl -u google-startup-scripts --no-pager && sudo journalctl -u kubelet --no-pager -n 100")
+		// We use sh -c to simple command chaining and redirection under sudo
+		cmd := `sudo sh -c "journalctl -u google-startup-scripts -u kubelet -u containerd --no-pager > /tmp/kingc-services.log && tar czf - /tmp/kingc-services.log /var/log/pods /var/log/containers"`
+		out, err := m.gce.RunSSHOutput(ctx, node.Name, node.Zone, cmd)
 		if err != nil {
 			klog.Warningf("  ⚠️ Failed to get logs from %s: %v", node.Name, err)
 			errs = append(errs, err)
 			continue
 		}
-		fName := fmt.Sprintf("%s/%s.log", outDir, node.Name)
+		fName := fmt.Sprintf("%s/%s.tar.gz", outDir, node.Name)
 		if err := os.WriteFile(fName, []byte(out), 0644); err != nil {
 			errs = append(errs, err)
 		}
