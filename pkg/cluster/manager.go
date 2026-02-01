@@ -54,7 +54,7 @@ func (m *Manager) measure(step string) func() {
 
 func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) (err error) {
 	defer m.measure("Create Cluster " + cfg.Metadata.Name)()
-	klog.Infof("🚀 Creating cluster '%s' (v%s) in region %s...", cfg.Metadata.Name, cfg.Spec.Kubernetes.Version, cfg.Spec.Region)
+	klog.Infof("🚀 Creating cluster '%s' (%s) in region %s...", cfg.Metadata.Name, cfg.Spec.Kubernetes.Version, cfg.Spec.Region)
 
 	// Ensure cleanup on failure unless retained
 	defer func() {
