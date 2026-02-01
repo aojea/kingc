@@ -291,6 +291,11 @@ func (c *Client) CreateInstance(ctx context.Context, name, zone, machineType, ne
 	return err
 }
 
+func (c *Client) DeleteInstance(ctx context.Context, name, zone string) error {
+	_, err := c.Run(ctx, "compute", "instances", "delete", name, "--zone", zone, "--quiet")
+	return err
+}
+
 // --- CAS (Private CA) Lifecycle ---
 
 func (c *Client) CreateCASPool(ctx context.Context, poolID, region string) error {

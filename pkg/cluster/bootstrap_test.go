@@ -1,51 +1,53 @@
 package cluster
 
 import (
-	"context"
-	"encoding/base64"
+	"bytes"
 	"strings"
 	"testing"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes/fake"
+	"text/template"
 )
 
-func TestCreateBootstrapResources(t *testing.T) {
-	client := fake.NewSimpleClientset() //nolint:staticcheck
-	token := "abcdef.0123456789abcdef"
-	caCert := []byte("fake-ca-cert")
-	endpoint := "https://127.0.0.1:6443"
+func TestRenderBootstrapTemplate(t *testing.T) {
+	// Read the template directly from the embed/fs (we need strict access to the package vars if they are private)
+	// templatesFS is private in package cluster. Tests are in package cluster, so we can access it.
 
-	err := CreateBootstrapResources(context.Background(), client, token, caCert, endpoint)
+	tmplName := "templates/bootstrap-resources.yaml"
+	tmplContent, err := templatesFS.ReadFile(tmplName)
 	if err != nil {
-		t.Fatalf("CreateBootstrapResources failed: %v", err)
+		t.Fatalf("Failed to read template: %v", err)
 	}
 
-	// Verify Secret
-	secret, err := client.CoreV1().Secrets(metav1.NamespaceSystem).Get(context.Background(), "bootstrap-token-abcdef", metav1.GetOptions{})
+	funcMap := template.FuncMap{
+		"indent": func(spaces int, v string) string {
+			pad := strings.Repeat(" ", spaces)
+			return pad + strings.ReplaceAll(v, "\n", "\n"+pad)
+		},
+	}
+
+	tmpl, err := template.New("bootstrap").Funcs(funcMap).Parse(string(tmplContent))
 	if err != nil {
-		t.Errorf("Secret not found: %v", err)
-	}
-	if string(secret.Data["token-id"]) != "abcdef" {
-		t.Errorf("Expected token-id 'abcdef', got %s", secret.Data["token-id"])
-	}
-	if string(secret.Data["auth-extra-groups"]) != "system:bootstrappers:kubeadm:default-node-token" {
-		t.Errorf("Unexpected auth-extra-groups: %s", secret.Data["auth-extra-groups"])
+		t.Fatalf("Failed to parse template: %v", err)
 	}
 
-	// Verify ConfigMap
-	cm, err := client.CoreV1().ConfigMaps("kube-public").Get(context.Background(), "cluster-info", metav1.GetOptions{})
-	if err != nil {
-		t.Errorf("ConfigMap cluster-info not found: %v", err)
-	}
-	encodedCA := base64.StdEncoding.EncodeToString(caCert)
-	if !strings.Contains(cm.Data["kubeconfig"], encodedCA) {
-		t.Errorf("Kubeconfig does not contain CA cert (expected base64: %s)", encodedCA)
+	data := BootstrapData{
+		TokenID:      "abcdef",
+		TokenSecret:  "0123456789abcdef",
+		Kubeconfig:   "apiVersion: v1\nclusters:\n- cluster:\n    server: foo",
+		JWSSignature: "fake-jws",
 	}
 
-	jwsKey := "jws-kubeconfig-abcdef"
-	if _, ok := cm.Data[jwsKey]; !ok {
-		t.Errorf("Missing JWS signature key %s", jwsKey)
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		t.Fatalf("Failed to execute template: %v", err)
+	}
+
+	output := buf.String()
+	// Validation
+	if !strings.Contains(output, "token-id: \"abcdef\"") {
+		t.Errorf("Output missing token-id")
+	}
+	if !strings.Contains(output, "    apiVersion: v1") { // Check indentation
+		t.Errorf("Indentation check failed for kubeconfig. Output:\n%s", output)
 	}
 }
 

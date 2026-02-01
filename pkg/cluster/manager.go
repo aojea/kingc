@@ -16,8 +16,6 @@ import (
 
 	"github.com/aojea/kingc/pkg/config"
 	"github.com/aojea/kingc/pkg/gce"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 )
 
@@ -275,16 +273,7 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 		templateData["DiscoveryTokenCaCertHash"] = caHash
 
 		// Create Bootstrap Resources via API
-		restConfig, err := clientcmd.RESTConfigFromKubeConfig([]byte(adminKubeconfig))
-		if err != nil {
-			return fmt.Errorf("failed to create rest config: %v", err)
-		}
-		k8sClient, err := kubernetes.NewForConfig(restConfig)
-		if err != nil {
-			return fmt.Errorf("failed to create k8s client: %v", err)
-		}
-
-		if err := CreateBootstrapResources(ctx, k8sClient, bootstrapToken, caCert, cfg.Spec.ExternalAPIServer.String()); err != nil {
+		if err := CreateBootstrapResources(ctx, localKubeconfig, bootstrapToken, caCert, cfg.Spec.ExternalAPIServer.String()); err != nil {
 			return fmt.Errorf("failed to create bootstrap resources: %v", err)
 		}
 		klog.Infof("    ✅ Bootstrap Token Secret and cluster-info created via API")
