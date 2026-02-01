@@ -389,6 +389,9 @@ func (c *Client) DeleteUnmanagedInstanceGroup(ctx context.Context, name, zone st
 type Instance struct {
 	Name string `json:"name"`
 	Zone string `json:"zone"`
+	Tags struct {
+		Items []string `json:"items"`
+	} `json:"tags"`
 }
 
 func (c *Client) ListInstances(ctx context.Context, tags []string) ([]Instance, error) {

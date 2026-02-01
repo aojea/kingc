@@ -539,3 +539,77 @@ func resolveSubnet(networks []config.NetworkSpec, netName, explicitSubnet string
 func basename(name string) string {
 	return "kingc-cluster-" + name
 }
+
+func (m *Manager) ListClusters(ctx context.Context) ([]string, error) {
+	// Find all control planes
+	instances, err := m.gce.ListInstances(ctx, []string{"kingc-role-control-plane"})
+	if err != nil {
+		return nil, err
+	}
+	clusters := make(map[string]bool)
+	for _, inst := range instances {
+		for _, tag := range inst.Tags.Items {
+			if strings.HasPrefix(tag, "kingc-cluster-") {
+				name := strings.TrimPrefix(tag, "kingc-cluster-")
+				clusters[name] = true
+			}
+		}
+	}
+	var result []string
+	for c := range clusters {
+		result = append(result, c)
+	}
+	return result, nil
+}
+
+func (m *Manager) ListNodes(ctx context.Context, clusterName string) ([]gce.Instance, error) {
+	return m.gce.ListInstances(ctx, []string{basename(clusterName)})
+}
+
+func (m *Manager) GetKubeconfig(ctx context.Context, clusterName string) (string, error) {
+	// Find a control plane node
+	instances, err := m.gce.ListInstances(ctx, []string{basename(clusterName), "kingc-role-control-plane"})
+	if err != nil {
+		return "", err
+	}
+	if len(instances) == 0 {
+		return "", fmt.Errorf("no control plane found for cluster %s", clusterName)
+	}
+	cp := instances[0]
+	// Cat the kubeconfig
+	out, err := m.gce.RunSSHOutput(ctx, cp.Name, cp.Zone, "sudo cat /etc/kubernetes/admin.conf")
+	if err != nil {
+		return "", fmt.Errorf("failed to retrieve kubeconfig: %v", err)
+	}
+	return strings.TrimSpace(out), nil
+}
+
+func (m *Manager) ExportLogs(ctx context.Context, clusterName, outDir string) error {
+	nodes, err := m.ListNodes(ctx, clusterName)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		return err
+	}
+
+	var errs []error
+	for _, node := range nodes {
+		// Capture startup script logs
+		klog.Infof("  Retrieving logs from %s...", node.Name)
+		out, err := m.gce.RunSSHOutput(ctx, node.Name, node.Zone, "sudo journalctl -u google-startup-scripts --no-pager && sudo journalctl -u kubelet --no-pager -n 100")
+		if err != nil {
+			klog.Warningf("  ⚠️ Failed to get logs from %s: %v", node.Name, err)
+			errs = append(errs, err)
+			continue
+		}
+		fName := fmt.Sprintf("%s/%s.log", outDir, node.Name)
+		if err := os.WriteFile(fName, []byte(out), 0644); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("encountered %d errors collecting logs", len(errs))
+	}
+	return nil
+}
