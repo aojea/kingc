@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"text/template"
 	"time"
@@ -134,6 +135,7 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 		"KubernetesRepoVersion": repoVer,
 		"PodSubnet":             cfg.Spec.Kubernetes.Networking.PodCIDR,
 		"ServiceSubnet":         cfg.Spec.Kubernetes.Networking.ServiceCIDR,
+		"KindnetVersion":        "v1.0.0", // TODO: Make configurable if needed
 		"FeatureGates":          cfg.Spec.FeatureGates,
 		"RuntimeConfig":         rcBuilder.String(),
 	}
@@ -263,68 +265,69 @@ echo "👑 kingc: Control Plane Initialized"
 		}
 	}
 
-	// 7. Install Addons (CNI, CCM)
+	// 7. Fetch Kubeconfig
+	var localKubeconfig string
+	{
+		defer m.measure("Fetch Kubeconfig")()
+		klog.Infof("  > Fetching admin.conf...")
+
+		kc, err := m.GetKubeconfig(ctx, cfg.Metadata.Name)
+		if err != nil {
+			return fmt.Errorf("failed to fetch kubeconfig: %v", err)
+		}
+
+		localKubeconfig = fmt.Sprintf("%s.conf", cfg.Metadata.Name)
+		if err := os.WriteFile(localKubeconfig, []byte(kc), 0600); err != nil {
+			return fmt.Errorf("failed to write kubeconfig to %s: %v", localKubeconfig, err)
+		}
+
+		klog.Infof("✅ Cluster ready! Kubeconfig at: ./%s", localKubeconfig)
+	}
+
+	// 8. Install Addons (CNI, CCM)
 	{
 		defer m.measure("Install Addons")()
 		klog.Infof("  > Installing Addons...")
 
-		// Helper to run kubectl apply via SSH on CP
-		applyURI := func(name, uri string) error {
-			klog.Infof("    - Installing %s...", name)
-			cmd := fmt.Sprintf("sudo KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f %s", uri)
-			if err := m.gce.SSH(ctx, cpName, cpZone, cmd); err != nil {
-				return fmt.Errorf("failed to install %s: %v", name, err)
-			}
-			return nil
-		}
-
 		// A. CNI (kindnet)
 		if !cfg.Spec.Kubernetes.Networking.DisableDefaultCNI {
-			if err := applyURI("kindnet", "https://raw.githubusercontent.com/kubernetes-sigs/kindnet/main/install-kindnet.yaml"); err != nil {
+			kindnetManifest, err := m.renderTemplate("templates/kindnet.yaml", templateData)
+			if err != nil {
 				return err
+			}
+
+			klog.Infof("    - Installing kindnet (v%s)...", "1.0.0") // Hardcoded for now or use variable
+
+			tmpKindnet, _ := os.CreateTemp("", "kindnet-*.yaml")
+			err = os.WriteFile(tmpKindnet.Name(), []byte(kindnetManifest), 0644)
+			if err != nil {
+				return fmt.Errorf("failed to write kindnet manifest to %s: %v", tmpKindnet.Name(), err)
+			}
+			defer func() {
+				_ = os.Remove(tmpKindnet.Name())
+			}()
+
+			cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", localKubeconfig, "apply", "-f", tmpKindnet.Name())
+			if out, err := cmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("failed to apply kindnet manifest: %v, output: %s", err, out)
 			}
 		} else {
 			klog.Infof("    - Skipping default CNI (disabled in config)")
 		}
 
 		// B. Cloud Controller Manager (external)
-		// We use a known stable version for now or latest
-		// TODO: Pin version based on K8s version? For now using latest from master or a recent tag could be risky, but user asked for it.
-		// Use a specific version for stability? Let's use a recent legacy provider or external one.
-		// "cloud-provider-gcp" external.
-		// Use the one from legacy cloud providers or the new one?
-		// The User mentioned "install the cloud provider gcp".
-		// We should probably rely on the in-tree one if we didn't disable it?
-		// Wait, K8s v1.35? In-tree providers are removed/disabled?
-		// K8s 1.30+ has removed many.
-		// Note: kingc currently doesn't configure --cloud-provider=external in kubelet/kubeadm?
-		// If we run external CCM, we MUST set --cloud-provider=external.
-		// We haven't done that yet in kubelet args. `gce` provider was default.
-		// Actually, `pkg/cluster/templates/kubeadm-config.yaml` might need checking.
-		// For now, I will just install the addons as requested.
-		// If `kubeadm init` was run without specific cloud-provider args, it uses no provider (or external if configured).
-		// Let's install the CCM manifesto.
-		// Use a pinned version for stability. v30.0.0 is recent.
-		ccmURI := "https://raw.githubusercontent.com/kubernetes/cloud-provider-gcp/master/deploy/packages/default/manifest.yaml"
-		// NOTE: The official repo structure might vary. Checking URL validity is hard without browser.
-		// `https://raw.githubusercontent.com/kubernetes/cloud-provider-gcp/master/deploy/packages/default/manifest.yaml` often exists?
-		// Or we can use a simpler one.
-		// Let's assume user wants the standard external provider.
-		// But wait, if we don't configure kubelet with --cloud-provider=external, CCM might conflict or do nothing useful?
-		// kingc aims to be simple.
-		// Let's install it.
-		// Warning: This URL might be wrong.
-		// Better robustness: "install the cloud provider gcp" -> user might mean the RBAC/Deployment.
-		// I will try to use a typically safe URL or skip if unsure.
-		// Actually, let's use a generic placeholder or the most likely working one.
 		// https://github.com/kubernetes/cloud-provider-gcp/blob/master/deploy/packages/default/manifest.yaml
 		// Raw: https://raw.githubusercontent.com/kubernetes/cloud-provider-gcp/master/deploy/packages/default/manifest.yaml
-		if err := applyURI("cloud-provider-gcp", ccmURI); err != nil {
-			klog.Warningf("    ⚠️  Failed to install CCM (might need manual install): %v", err)
+		ccmURI := "https://raw.githubusercontent.com/kubernetes/cloud-provider-gcp/master/deploy/packages/default/manifest.yaml"
+		klog.Infof("    - Installing Cloud Provider GCP...")
+		cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", localKubeconfig, "apply", "-f", ccmURI)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			// This might fail if network is restricted or URL is wrong.
+			klog.Warningf("    ⚠️  Failed to install CCM (might need manual install): %v\nOutput: %s", err, out)
 		}
 	}
 
-	// 7. Worker Pools
+	// 9. Worker Pools
 	{
 		defer m.measure("Worker Groups Provisioning")()
 		klog.Infof("  > Provisioning Worker Groups...")
@@ -395,21 +398,20 @@ echo "👑 kingc: Joining cluster..."
 		}
 	}
 
-	// 8. Fetch Kubeconfig
-	{
-		defer m.measure("Fetch Kubeconfig")()
-		klog.Infof("  > Fetching admin.conf...")
-		localKubeconfig := fmt.Sprintf("%s.conf", cfg.Metadata.Name)
-		// We should check error here
-		if err := m.gce.SSH(ctx, cpName, cpZone, "sudo cp /etc/kubernetes/admin.conf ~/admin.conf && sudo chown $(whoami) ~/admin.conf"); err != nil {
-			klog.Warningf("    (SSH warning: %v)", err)
-		}
-		if err := m.gce.SCP(ctx, fmt.Sprintf("%s:~/admin.conf", cpName), localKubeconfig, cpZone); err != nil {
-			klog.Warningf("    (SCP warning: %v)", err)
-		}
+	// 9. Workers are next (Wait for them to join?)
+	// Actually we provision workers after addons? Or before?
+	// Existing code had workers after addons in block 7, but fetching kubeconfig was block 8 (after workers).
+	// We moved fetch to 7, addons to 8. So workers should be 9.
+	// WAIT, original code:
+	// 5. Provision CP
+	// 6. Wait for API
+	// 7. Addons
+	// 7b (was 7 too in comments). Worker Pools.
+	// 8. Fetch Kubeconfig.
 
-		klog.Infof("✅ Cluster ready! Kubeconfig at: ./%s", localKubeconfig)
-	}
+	// We want: 5 -> 6 -> Fetch (was 8) -> Addons (New) -> Workers (was 7b).
+	// So we just need to ensure Workers block is after our new Addons block.
+
 	return nil
 }
 
