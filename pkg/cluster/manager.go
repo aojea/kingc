@@ -231,7 +231,7 @@ echo "👑 kingc: Control Plane Initialized"
 
 	// 7. Worker Pools
 	klog.Infof("  > Provisioning Worker Groups...")
-	tokenCmd := "sudo kubeadm token create --print-join-command"
+	tokenCmd := "sudo /usr/bin/kubeadm token create --print-join-command"
 	joinCommand, err := m.gce.RunSSHOutput(ctx, cpName, cpZone, tokenCmd)
 	if err != nil {
 		return fmt.Errorf("failed to get join command: %v", err)
@@ -283,7 +283,7 @@ echo "👑 kingc: Joining cluster..."
 			tmplName, grp.MachineType, networks, subnets,
 			config.DefaultImageFamily, tmpWorkerStartup.Name(),
 			[]string{
-				"kingc-cluster-" + cfg.Metadata.Name,
+				basename(cfg.Metadata.Name),
 				"kingc-role-worker",
 				"kingc-group-" + grp.Name,
 			},
