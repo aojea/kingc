@@ -177,7 +177,7 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 	// 6. Wait for Control Plane Ready
 	{
 		defer m.measure("Wait for API Server")()
-		klog.Infof("  > Waiting for Kubernetes API Server (%s:6443) to be ready...", cfg.Spec.ExternalAPIServer.String())
+		klog.Infof("  > Waiting for Kubernetes API Server (%s) to be ready...", cfg.Spec.ExternalAPIServer.String())
 		timeout := 5 * time.Minute
 		if err := m.waitForAPIServer(ctx, cfg.Spec.ExternalAPIServer, timeout); err != nil {
 			return fmt.Errorf("control plane failed to initialize after %v: %v", timeout, err)
