@@ -424,7 +424,7 @@ func (c *Client) CreateContainerInstance(
 	}
 
 	for _, arg := range containerArgs {
-		args = append(args, "--container-arg", arg)
+		args = append(args, fmt.Sprintf("--container-arg=%s", arg))
 	}
 
 	if len(metadata) > 0 {
