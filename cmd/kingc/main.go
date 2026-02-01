@@ -56,6 +56,11 @@ func runCreate(cmd *cobra.Command, args []string) {
 	var cfg *config.Cluster
 	var err error
 
+	name, _ := cmd.Flags().GetString("name")
+	if name == "" {
+		klog.Fatalf("❌ Error: name is required")
+	}
+
 	if configFile != "" {
 		cfg, err = config.Load(configFile)
 		if err != nil {
@@ -66,10 +71,6 @@ func runCreate(cmd *cobra.Command, args []string) {
 		cfg = config.Default()
 	}
 	// override default name if specified
-	name, _ := cmd.Flags().GetString("name")
-	if name != "" {
-		cfg.Metadata.Name = name
-	}
 
 	retain, _ := cmd.Flags().GetBool("retain")
 

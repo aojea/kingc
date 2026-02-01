@@ -53,8 +53,6 @@ Create kingc.yaml:
 
 ```yaml
 version: v1alpha1
-metadata:
-  name: sandbox
 spec:
   # Region applies globally, per example to Networking and API LB
   region: us-central1
@@ -71,7 +69,7 @@ spec:
     machineType: n1-standard-2
 ```
 
-Run: `kingc create --config kingc.yaml`
+Run: `kingc create --config kingc.yaml --name sandbox`
 
 
 ### Export Kubeconfig
@@ -112,8 +110,6 @@ High-performance GPU clusters require precise network isolation. `kingc` allows 
 
 ```yaml
 version: v1alpha1
-metadata:
-  name: a4-titanium-cluster
 spec:
   region: us-south1
   
