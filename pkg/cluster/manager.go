@@ -292,7 +292,7 @@ echo "👑 kingc: Joining cluster..."
 		tmplName := fmt.Sprintf("%s-%s-tmpl", cfg.Metadata.Name, grp.Name)
 		if err := m.gce.CreateInstanceTemplate(
 			tmplName, grp.MachineType, networks, subnets,
-			config., tmpWorkerStartup.Name(),
+			config.DefaultImageFamily, tmpWorkerStartup.Name(),
 			[]string{
 				"kingc-cluster-" + cfg.Metadata.Name,
 				"kingc-role-worker",

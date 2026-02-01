@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+
+	"github.com/aojea/kingc/pkg/config"
 )
 
 type Client struct{}
@@ -157,7 +159,7 @@ func (c *Client) CreateInstance(name, zone, machineType, network, subnet, image,
 		"--network", network,
 		"--subnet", subnet,
 		"--image-family", image,
-		"--image-project", "ubuntu-os-cloud",
+		"--image-project", config.DefaultImageProject,
 		"--boot-disk-size", "50GB",
 		"--scopes", "cloud-platform",
 		"--tags", strings.Join(tags, ","),
@@ -227,7 +229,7 @@ func (c *Client) CreateInstanceTemplate(name, machineType string, networks, subn
 		"compute", "instance-templates", "create", name,
 		"--machine-type", machineType,
 		"--image-family", image,
-		"--image-project", "ubuntu-os-cloud",
+		"--image-project", config.DefaultImageProject,
 		"--boot-disk-size", "50GB",
 		"--scopes", "cloud-platform",
 		"--tags", strings.Join(tags, ","),

@@ -22,6 +22,9 @@ const (
 
 	DefaultControlPlaneName = "control-plane"
 	DefaultWorkerGroupName  = "workers"
+
+	DefaultImageProject = "ubuntu-os-cloud"
+	DefaultImageFamily  = "ubuntu-2204-lts"
 )
 
 // SetDefaults applies default values to the configuration
