@@ -347,13 +347,22 @@ func runGetKubeconfig(cmd *cobra.Command, args []string) {
 
 func runExportLogs(cmd *cobra.Command, args []string) {
 	name, _ := cmd.Flags().GetString("name")
-	outDir := "."
+	var outDir string
+	var err error
+
 	if len(args) > 0 {
 		outDir = args[0]
+	} else {
+		// Default: Create a temporary directory
+		outDir, err = os.MkdirTemp("", "kingc-logs-*")
+		if err != nil {
+			klog.Fatalf("❌ Error creating temp dir for logs: %v", err)
+		}
 	}
+
 	client := getClient(cmd)
 	if err := cluster.NewManager(client).ExportLogs(cmd.Context(), name, outDir); err != nil {
 		klog.Fatalf("❌ Error exporting logs: %v", err)
 	}
-	klog.Infof("✅ Logs exported to %s", outDir)
+	fmt.Printf("✅ Logs exported to %s\n", outDir)
 }
