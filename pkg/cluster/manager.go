@@ -25,8 +25,8 @@ type Manager struct {
 	gce *gce.Client
 }
 
-func NewManager() *Manager {
-	return &Manager{gce: gce.NewClient()}
+func NewManager(client *gce.Client) *Manager {
+	return &Manager{gce: client}
 }
 
 func (m *Manager) Preflight(ctx context.Context) error {
