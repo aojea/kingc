@@ -26,3 +26,16 @@ lint:
 
 update:
 	go mod tidy
+
+# kube-apiserver image
+KUBE_APISERVER_IMAGE?=kingc-apiserver
+KUBE_APISERVER_TAG?=latest
+KUBE_VERSION?=v1.35.0
+ETCD_VERSION?=v3.5.12
+
+image-kubeapiserver:
+	docker build \
+		--build-arg KUBE_VERSION=$(KUBE_VERSION) \
+		--build-arg ETCD_VERSION=$(ETCD_VERSION) \
+		-t $(KUBE_APISERVER_IMAGE):$(KUBE_APISERVER_TAG) \
+		kubeapiserver/
