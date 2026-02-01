@@ -15,10 +15,35 @@ var rootCmd = &cobra.Command{
 	Short: "Kubernetes IN Google Cloud",
 }
 
+var createCmd = &cobra.Command{
+	Use:   "create",
+	Short: "Create a new cluster",
+	Run:   runCreate,
+}
+
+var deleteCmd = &cobra.Command{
+	Use:   "delete",
+	Short: "Tear down a cluster",
+	Run:   runDelete,
+}
+
+func init() {
+	rootCmd.AddCommand(createCmd)
+	rootCmd.AddCommand(deleteCmd)
+
+	createCmd.Flags().String("config", "", "Path to a kingc.yaml config file")
+	createCmd.Flags().String("name", "kingc", "Cluster name")
+	createCmd.Flags().Bool("retain", false, "Retain resources on failure for debugging")
+
+	deleteCmd.Flags().String("name", "kingc", "Cluster name")
+
+	// Integrate standard flag with pflag
+	rootCmd.PersistentFlags().AddGoFlagSet(flag.CommandLine)
+}
+
 func main() {
 	klog.InitFlags(nil)
 	flag.CommandLine.Set("logtostderr", "true")
-	flag.Parse()
 
 	if err := rootCmd.Execute(); err != nil {
 		klog.Error(err)
