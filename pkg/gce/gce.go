@@ -260,6 +260,13 @@ func (c *Client) EnsureStaticIP(ctx context.Context, name, region string) (strin
 	return addr.Address, err
 }
 
+func (c *Client) DeleteStaticIP(ctx context.Context, name, region string) error {
+	if _, err := c.Run(ctx, "compute", "addresses", "delete", name, "--region", region, "--quiet"); err != nil && !IsAlreadyExistsError(err) {
+		return err
+	}
+	return nil
+}
+
 func (c *Client) CreateInstance(ctx context.Context, name, zone, machineType, network, subnet, image, serviceAccount, startupScript, address string, tags []string) error {
 	args := []string{
 		"compute", "instances", "create", name,
@@ -329,7 +336,9 @@ func (c *Client) DeleteCASPool(ctx context.Context, poolID, region string) error
 	return err
 }
 
-func (c *Client) SignCASCertificate(ctx context.Context, csrPEM []byte, pool, location, caName string, isCA bool) ([]byte, error) {
+// SignCASCertificate signs a CSR using Google Cloud CAS with specified validity.
+// The CSR must contain all necessary extensions (BasicConstraints, KeyUsage, etc.).
+func (c *Client) SignCASCertificate(ctx context.Context, csrPEM []byte, pool, location, caName string, validity string) ([]byte, error) {
 	tmpCsr, err := os.CreateTemp("", "kingc-csr-*.pem")
 	if err != nil {
 		return nil, err
@@ -348,8 +357,6 @@ func (c *Client) SignCASCertificate(ctx context.Context, csrPEM []byte, pool, lo
 	defer func() { _ = os.Remove(tmpCert.Name()) }()
 
 	// certID must be unique. Let's use a random suffix or timestamp.
-	// But `gcloud privateca certificates create` requires an ID.
-	// If we use current timestamp, it might collide if called very rapidly, but unlikely here.
 	certID := fmt.Sprintf("kingc-cert-%d", time.Now().UnixNano())
 	args := []string{
 		"privateca", "certificates", "create", certID,
@@ -357,17 +364,11 @@ func (c *Client) SignCASCertificate(ctx context.Context, csrPEM []byte, pool, lo
 		"--cert-output-file", tmpCert.Name(),
 		"--issuer-pool", pool,
 		"--issuer-location", location,
-		"--validity", "P1Y",
+		"--validity", validity,
 		"--quiet",
 	}
 	if caName != "" {
 		args = append(args, "--ca", caName)
-	}
-	if isCA {
-		args = append(args,
-			"--is-ca-cert",
-			"--use-preset-profile=subordinate_mtls_path_len_0",
-		)
 	}
 
 	if _, err := c.Run(ctx, args...); err != nil {

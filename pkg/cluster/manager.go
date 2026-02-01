@@ -12,6 +12,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"embed"
+	"encoding/asn1"
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
@@ -41,13 +42,18 @@ type Manager struct {
 }
 
 type ExternalAPIServerResult struct {
-	Endpoint    string
-	CACert      []byte
-	SigningKey  []byte // New: For KCM CSR Signing
-	SigningCert []byte // New: For KCM CSR Signing
-	SAKey       []byte
-	SAPub       []byte
-	Kubeconfig  string
+	Endpoint string
+	CACert   []byte
+	// Signing info for KCM (Node CA)
+	SigningKey  []byte
+	SigningCert []byte
+	// Service Account Keys/Pub
+	SAKey []byte
+	SAPub []byte
+	// Kubeconfigs (generated during CA lifecycle)
+	AdminKubeconfig             string
+	SchedulerKubeconfig         string
+	ControllerManagerKubeconfig string
 }
 
 func NewManager(client *gce.Client) *Manager {
@@ -188,33 +194,17 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 		}
 		cfg.Spec.ExternalAPIServer = u
 
-		// Generate Admin Kubeconfig locally
-		{
-			klog.Infof("  > Generating local kubeconfigs...")
+		// Use generated kubeconfigs
+		adminKubeconfig = res.AdminKubeconfig
+		schedulerKubeconfig = res.SchedulerKubeconfig
+		cmKubeconfig = res.ControllerManagerKubeconfig
 
-			// 1. Admin
-			adminKubeconfig, err = m.signKubeconfig(ctx, cfg, "kubernetes-admin", []string{"system:masters"}, res.CACert)
-			if err != nil {
-				return fmt.Errorf("signing admin kubeconfig: %v", err)
-			}
-			localKubeconfig = filepath.Join(tmpDir, "admin.conf")
-			if err := os.WriteFile(localKubeconfig, []byte(adminKubeconfig), 0600); err != nil {
-				return fmt.Errorf("failed to write kubeconfig to %s: %v", localKubeconfig, err)
-			}
-			klog.Infof("    ✅ Admin Kubeconfig generated locally at %s", localKubeconfig)
-
-			// 2. Scheduler
-			schedulerKubeconfig, err = m.signKubeconfig(ctx, cfg, "system:kube-scheduler", []string{"system:kube-scheduler"}, res.CACert)
-			if err != nil {
-				return fmt.Errorf("signing scheduler kubeconfig: %v", err)
-			}
-
-			// 3. Controller Manager
-			cmKubeconfig, err = m.signKubeconfig(ctx, cfg, "system:kube-controller-manager", []string{"system:kube-controller-manager"}, res.CACert)
-			if err != nil {
-				return fmt.Errorf("signing controller-manager kubeconfig: %v", err)
-			}
+		// Write Admin Kubeconfig locally for kubectl usage
+		localKubeconfig = filepath.Join(tmpDir, "admin.conf")
+		if err := os.WriteFile(localKubeconfig, []byte(adminKubeconfig), 0600); err != nil {
+			return fmt.Errorf("failed to write kubeconfig to %s: %v", localKubeconfig, err)
 		}
+		klog.Infof("    ✅ Admin Kubeconfig generated locally at %s", localKubeconfig)
 
 		// Store PKI data for Control Plane provisioning
 		caCert = res.CACert
@@ -892,21 +882,70 @@ func (m *Manager) EnsureExternalAPIServer(ctx context.Context, cfg *config.Clust
 		return nil, fmt.Errorf("failed to create CAS Root CA: %v", err)
 	}
 
-	// 3. Generate CSR for API Server
-	// Generate local key
-	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	// 3. CA Hierarchy Setup (3-CA Architecture)
+	// 3.1 Cluster CA (Intermediate, Ephemeral Key)
+	clusterCAKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate rsa key: %v", err)
+		return nil, fmt.Errorf("generate cluster ca key: %v", err)
 	}
-	keyBytes := x509.MarshalPKCS1PrivateKey(privKey)
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: keyBytes})
+	clusterCACSR, err := m.createCACSR(clusterCAKey, "cluster-ca")
+	if err != nil {
+		return nil, fmt.Errorf("create cluster ca csr: %v", err)
+	}
+	clusterCACertPEM, err := m.gce.SignCASCertificate(ctx, clusterCACSR, poolID, casRegion, caID, "P30Y")
+	if err != nil {
+		return nil, fmt.Errorf("sign cluster ca: %v", err)
+	}
+	clusterCACert, err := ParseCertificatePEM(clusterCACertPEM)
+	if err != nil {
+		return nil, fmt.Errorf("parse cluster ca cert: %v", err)
+	}
 
-	// CSR
-	subj := pkix.Name{
-		CommonName:   "kube-apiserver",
-		Organization: []string{"kingc"},
+	// 3.2 Node CA (Intermediate, Persistent Key)
+	nodeCAKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, fmt.Errorf("generate node ca key: %v", err)
 	}
-	// Add SANs: Localhhost, IP, kubernetes service IP
+	nodeCAKeyBytes := x509.MarshalPKCS1PrivateKey(nodeCAKey)
+	nodeCAKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: nodeCAKeyBytes})
+
+	nodeCACSR, err := m.createCACSR(nodeCAKey, "node-ca")
+	if err != nil {
+		return nil, fmt.Errorf("create node ca csr: %v", err)
+	}
+	nodeCACertPEM, err := m.gce.SignCASCertificate(ctx, nodeCACSR, poolID, casRegion, caID, "P30Y")
+	if err != nil {
+		return nil, fmt.Errorf("sign node ca: %v", err)
+	}
+
+	// 3.3 Front Proxy CA (Intermediate, Ephemeral Client Signing)
+	fpCAKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, fmt.Errorf("generate front-proxy ca key: %v", err)
+	}
+	fpCACSR, err := m.createCACSR(fpCAKey, "front-proxy-ca")
+	if err != nil {
+		return nil, fmt.Errorf("create front-proxy ca csr: %v", err)
+	}
+	fpCACertPEM, err := m.gce.SignCASCertificate(ctx, fpCACSR, poolID, casRegion, caID, "P30Y")
+	if err != nil {
+		return nil, fmt.Errorf("sign front-proxy ca: %v", err)
+	}
+	fpCACert, err := ParseCertificatePEM(fpCACertPEM)
+	if err != nil {
+		return nil, fmt.Errorf("parse front-proxy ca cert: %v", err)
+	}
+
+	// 4. Leaf Certificates
+	// 4.1 API Server Serving Cert (Signed by Cluster CA)
+	apiServerKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, fmt.Errorf("generate apiserver key: %v", err)
+	}
+	apiServerKeyBytes := x509.MarshalPKCS1PrivateKey(apiServerKey)
+	apiServerKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: apiServerKeyBytes})
+
+	// Add SANs
 	dnsNames := []string{
 		"kubernetes",
 		"kubernetes.default",
@@ -915,117 +954,100 @@ func (m *Manager) EnsureExternalAPIServer(ctx context.Context, cfg *config.Clust
 		"localhost",
 		name,
 	}
-	// Calculate the first IP of the Service CIDR (e.g. 10.96.0.1 for 10.96.0.0/12)
 	svcPrefix, err := netip.ParsePrefix(cfg.Spec.Kubernetes.Networking.ServiceCIDR)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse service cidr: %v", err)
 	}
-	svcIP := svcPrefix.Addr().Next() // First IP is usually gateway/apiserver
-
+	svcIP := svcPrefix.Addr().Next()
 	ips := []net.IP{
 		net.ParseIP(ip),
 		net.ParseIP("127.0.0.1"),
 		net.ParseIP(svcIP.String()),
 	}
 
-	template := x509.CertificateRequest{
-		Subject:     subj,
-		DNSNames:    dnsNames,
-		IPAddresses: ips,
-	}
-	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, &template, privKey)
+	apiServerCertPEM, err := m.SignLocalCertificate(
+		apiServerKey.Public(),
+		clusterCAKey, clusterCACert,
+		"kube-apiserver",
+		[]string{"kingc"},
+		ips, dnsNames,
+		true, // isServer
+	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create CSR: %v", err)
-	}
-	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrBytes})
-
-	// 4. Sign CSR
-	// We need to use "gcloud privateca certificates create"
-	certPEM, err := m.gce.SignCASCertificate(ctx, csrPEM, poolID, casRegion, caID, false)
-	if err != nil {
-		return nil, fmt.Errorf("failed to sign certificate: %v", err)
+		return nil, fmt.Errorf("sign apiserver cert: %v", err)
 	}
 
-	// 4.5 Get Root CA
-	caPEM, err := m.gce.GetCASRootCertificate(ctx, poolID, casRegion, caID)
+	// 4.2 Front Proxy Client Cert (Signed by Front Proxy CA)
+	fpClientKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get root CA: %v", err)
+		return nil, fmt.Errorf("generate front-proxy client key: %v", err)
+	}
+	fpClientKeyBytes := x509.MarshalPKCS1PrivateKey(fpClientKey)
+	fpClientKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: fpClientKeyBytes})
+
+	fpClientCertPEM, err := m.SignLocalCertificate(
+		fpClientKey.Public(),
+		fpCAKey, fpCACert,
+		"front-proxy-client",
+		nil,
+		nil, nil, false,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sign front-proxy client cert: %v", err)
 	}
 
-	// 5. Setup Service Account Keys
-	// CAS is not used for SA keys (JWT signing), so we generate them locally.
-	// We generate them here ensuring the Manager is the source of truth.
+	// 5. Service Account Keys (Local)
 	saPrivKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate sa key: %v", err)
+		return nil, fmt.Errorf("generate sa key: %v", err)
 	}
 	saKeyBytes := x509.MarshalPKCS1PrivateKey(saPrivKey)
 	saKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: saKeyBytes})
 
 	saPubKeyBytes, err := x509.MarshalPKIXPublicKey(&saPrivKey.PublicKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal sa public key: %v", err)
+		return nil, fmt.Errorf("marshal sa public key: %v", err)
 	}
 	saPubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: saPubKeyBytes})
 
-	// 5.5 Front Proxy PKI
-	// 5.5.1 Generate Front Proxy CA (Delegated Intermediate)
-	fpCAKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	// 6. Generate Kubeconfigs (Signed by Cluster CA)
+	// 6.1 Admin
+	adminClientKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate front-proxy ca key: %v", err)
+		return nil, fmt.Errorf("generate admin key: %v", err)
 	}
-	fpCAKeyBytes := x509.MarshalPKCS1PrivateKey(fpCAKey)
-	fpCAKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: fpCAKeyBytes})
-
-	fpCATmpl := x509.CertificateRequest{
-		Subject: pkix.Name{CommonName: "front-proxy-ca"},
-	}
-	fpCACSRBytes, err := x509.CreateCertificateRequest(rand.Reader, &fpCATmpl, fpCAKey)
+	adminClientKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(adminClientKey)})
+	adminClientCertPEM, err := m.SignLocalCertificate(adminClientKey.Public(), clusterCAKey, clusterCACert, "kubernetes-admin", []string{"system:masters"}, nil, nil, false)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create front-proxy ca csr: %v", err)
+		return nil, fmt.Errorf("sign admin cert: %v", err)
 	}
-	fpCACSRPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: fpCACSRBytes})
+	adminKC := config.GenerateKubeconfig(cfg.Metadata.Name, fmt.Sprintf("https://%s:6443", ip), "kubernetes-admin", clusterCACertPEM, adminClientCertPEM, adminClientKeyPEM)
 
-	// Sign Front Proxy CA with CAS (isCA=true)
-	fpCACertPEM, err := m.gce.SignCASCertificate(ctx, fpCACSRPEM, poolID, casRegion, caID, true)
+	// 6.2 Scheduler
+	schedKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return nil, fmt.Errorf("failed to sign front-proxy ca cert: %v", err)
+		return nil, fmt.Errorf("generate scheduler key: %v", err)
 	}
-
-	// 5.5.2 Generate Front Proxy Client Cert (Signed by Local Front Proxy CA)
-	fpClientKey, fpClientCertPEM, err := m.generateSignedCert(fpCAKeyPEM, fpCACertPEM, "front-proxy-client", nil)
+	schedKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(schedKey)})
+	schedCertPEM, err := m.SignLocalCertificate(schedKey.Public(), clusterCAKey, clusterCACert, "system:kube-scheduler", []string{"system:kube-scheduler"}, nil, nil, false)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate front-proxy client cert: %v", err)
+		return nil, fmt.Errorf("sign scheduler cert: %v", err)
 	}
-	// Decode Client Key for startup script (generateSignedCert returns PEM)
-	fpClientKeyPEM := fpClientKey
+	schedKC := config.GenerateKubeconfig(cfg.Metadata.Name, fmt.Sprintf("https://%s:6443", ip), "system:kube-scheduler", clusterCACertPEM, schedCertPEM, schedKeyPEM)
 
-	// 5.6 Cluster Signing CA (Local, for KCM CSR Signing)
-	// We generate this locally because KCM needs the private key to sign CSRs.
-	// CAS keys are not exportable.
-	signCAKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	// 6.3 Controller Manager
+	cmKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate signing ca key: %v", err)
+		return nil, fmt.Errorf("generate cm key: %v", err)
 	}
-	signCAKeyBytes := x509.MarshalPKCS1PrivateKey(signCAKey)
-	signCAKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: signCAKeyBytes})
-
-	signCATmpl := x509.CertificateRequest{
-		Subject: pkix.Name{CommonName: "cluster-signing-ca"},
-	}
-	signCACSRBytes, err := x509.CreateCertificateRequest(rand.Reader, &signCATmpl, signCAKey)
+	cmKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(cmKey)})
+	cmCertPEM, err := m.SignLocalCertificate(cmKey.Public(), clusterCAKey, clusterCACert, "system:kube-controller-manager", []string{"system:kube-controller-manager"}, nil, nil, false)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create signing ca csr: %v", err)
+		return nil, fmt.Errorf("sign cm cert: %v", err)
 	}
-	signCACSRPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: signCACSRBytes})
+	cmKC := config.GenerateKubeconfig(cfg.Metadata.Name, fmt.Sprintf("https://%s:6443", ip), "system:kube-controller-manager", clusterCACertPEM, cmCertPEM, cmKeyPEM)
 
-	// Sign Signing CA with CAS (isCA=true) -> Intermediate CA
-	signCACertPEM, err := m.gce.SignCASCertificate(ctx, signCACSRPEM, poolID, casRegion, caID, true)
-	if err != nil {
-		return nil, fmt.Errorf("failed to sign signing ca cert: %v", err)
-	}
-
-	// 6. Embed generic startup script
+	// 7. Embed startup script
 	startupScript := `#! /bin/bash
 mkdir -p /var/lib/kingc/pki
 cd /var/lib/kingc/pki
@@ -1040,8 +1062,6 @@ chmod 600 *
 	}
 
 	// Append to startup script to write certs and keys
-	// Note: We append signing-ca.crt to ca.crt (Trust Bundle)
-	// The API Server needs to trust certificates issued by this Signing CA.
 	startupScript += fmt.Sprintf(`
 echo "%s" > /var/lib/kingc/pki/apiserver.key
 echo "%s" > /var/lib/kingc/pki/apiserver.crt
@@ -1049,11 +1069,17 @@ echo "%s" > /var/lib/kingc/pki/run-ca.crt
 echo "%s" >> /var/lib/kingc/pki/run-ca.crt
 mv /var/lib/kingc/pki/run-ca.crt /var/lib/kingc/pki/ca.crt
 echo "%s" > /var/lib/kingc/pki/sa.pub
-echo "%s" > /var/lib/kingc/pki/front-proxy-ca.key
+echo "%s" > /var/lib/kingc/pki/sa.key
 echo "%s" > /var/lib/kingc/pki/front-proxy-ca.crt
 echo "%s" > /var/lib/kingc/pki/front-proxy-client.crt
 echo "%s" > /var/lib/kingc/pki/front-proxy-client.key
-`, string(keyPEM), string(certPEM), string(caPEM), string(signCACertPEM), string(saPubPEM), string(fpCAKeyPEM), string(fpCACertPEM), string(fpClientCertPEM), string(fpClientKeyPEM))
+`,
+		string(apiServerKeyPEM), string(apiServerCertPEM),
+		string(clusterCACertPEM), string(nodeCACertPEM),
+		string(saPubPEM), string(saKeyPEM),
+		string(fpCACertPEM),
+		string(fpClientCertPEM), string(fpClientKeyPEM),
+	)
 
 	args := []string{
 		"--secure-port=6443",
@@ -1107,60 +1133,95 @@ echo "%s" > /var/lib/kingc/pki/front-proxy-client.key
 	}
 
 	return &ExternalAPIServerResult{
-		Endpoint:    ip,
-		CACert:      caPEM,
-		SigningKey:  signCAKeyPEM,
-		SigningCert: signCACertPEM,
-		SAKey:       saKeyPEM,
-		SAPub:       saPubPEM,
+		Endpoint:                    ip,
+		CACert:                      clusterCACertPEM,
+		SigningKey:                  nodeCAKeyPEM,
+		SigningCert:                 nodeCACertPEM,
+		SAKey:                       saKeyPEM,
+		SAPub:                       saPubPEM,
+		AdminKubeconfig:             adminKC,
+		SchedulerKubeconfig:         schedKC,
+		ControllerManagerKubeconfig: cmKC,
 	}, nil
 }
 
-func (m *Manager) signKubeconfig(ctx context.Context, cfg *config.Cluster, cn string, orgs []string, caCert []byte) (string, error) {
-	// Generate Key
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return "", fmt.Errorf("generate key: %v", err)
-	}
-	keyBytes := x509.MarshalPKCS1PrivateKey(key)
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: keyBytes})
-
-	// CSR
+// createCACSR generates a CSR for a CA with BasicConstraints: CA:TRUE and KeyUsage: KeyCertSign|CRLSign.
+func (m *Manager) createCACSR(key *rsa.PrivateKey, cn string) ([]byte, error) {
 	subj := pkix.Name{
 		CommonName:   cn,
-		Organization: orgs,
+		Organization: []string{"kingc"},
 	}
-	template := x509.CertificateRequest{
-		Subject: subj,
+
+	type basicConstraints struct {
+		IsCA       bool `asn1:"optional"`
+		MaxPathLen int  `asn1:"optional,default:-1"`
 	}
-	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, &template, key)
+	bc := basicConstraints{IsCA: true, MaxPathLen: -1}
+	bcBytes, err := asn1.Marshal(bc)
 	if err != nil {
-		return "", fmt.Errorf("create csr: %v", err)
+		return nil, fmt.Errorf("marshal basic constraints: %v", err)
 	}
-	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrBytes})
 
-	// Sign with CAS
-	poolID := fmt.Sprintf("kingc-pool-%s", cfg.Metadata.Name)
-	caID := fmt.Sprintf("kingc-ca-%s", cfg.Metadata.Name)
-	casRegion := cfg.Spec.Region
+	extBC := pkix.Extension{
+		Id:       asn1.ObjectIdentifier{2, 5, 29, 19},
+		Critical: true,
+		Value:    bcBytes,
+	}
 
-	// isCA=false for Client Certs
-	certPEM, err := m.gce.SignCASCertificate(ctx, csrPEM, poolID, casRegion, caID, false)
+	tmpl := x509.CertificateRequest{
+		Subject:         subj,
+		ExtraExtensions: []pkix.Extension{extBC},
+	}
+
+	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, &tmpl, key)
 	if err != nil {
-		return "", fmt.Errorf("sign certificate: %v", err)
+		return nil, err
 	}
-
-	// Generate Kubeconfig
-	return config.GenerateKubeconfig(
-		cfg.Metadata.Name,
-		cfg.Spec.ExternalAPIServer.String(),
-		cn,
-		caCert,
-		certPEM,
-		keyPEM,
-	), nil
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrBytes}), nil
 }
 
+// SignLocalCertificate signs a leaf certificate using a local CA key/cert.
+func (m *Manager) SignLocalCertificate(pubKey any, caKey *rsa.PrivateKey, caCert *x509.Certificate, cn string, orgs []string, ipSANS []net.IP, dnsSANS []string, isServer bool) ([]byte, error) {
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, err
+	}
+
+	tmpl := x509.Certificate{
+		SerialNumber: serial,
+		Subject: pkix.Name{
+			CommonName:   cn,
+			Organization: orgs,
+		},
+		DNSNames:              dnsSANS,
+		IPAddresses:           ipSANS,
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour), // 1 Year
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  false,
+	}
+
+	if isServer {
+		tmpl.ExtKeyUsage = append(tmpl.ExtKeyUsage, x509.ExtKeyUsageServerAuth)
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, caCert, pubKey, caKey)
+	if err != nil {
+		return nil, err
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), nil
+}
+
+// ParseCertificatePEM parses a PEM-encoded certificate.
+func ParseCertificatePEM(data []byte) (*x509.Certificate, error) {
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, fmt.Errorf("failed to decode PEM")
+	}
+	return x509.ParseCertificate(block.Bytes)
+}
 func (m *Manager) createBootstrapToken(ctx context.Context, kubeconfigPath string, caCert []byte) (token string, caHash string, err error) {
 	// 1. Calculate CA Cert Hash (Discovery Token CA Cert Hash)
 	// openssl x509 -in ca.crt -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256
