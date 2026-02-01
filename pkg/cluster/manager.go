@@ -5,12 +5,19 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"embed"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -42,6 +49,17 @@ func (m *Manager) Preflight(ctx context.Context) error {
 		return err
 	}
 	if err := m.gce.VerifyComputeAPI(ctx); err != nil {
+		return err
+	}
+	// Verify Compute Engine API (compute.googleapis.com) explicitly if VerifyComputeAPI didn't catch it,
+	// checking against the service list is more robust for "enabled" status.
+	// Also explicitly check for 'iam.googleapis.com' if we need it for service accounts,
+	// 'cloudresourcemanager.googleapis.com' for project checks, and
+	// 'certificatemanager.googleapis.com' for certificate management.
+	if err := m.gce.CheckServicesEnabled(ctx, []string{
+		"compute.googleapis.com",
+		"certificatemanager.googleapis.com",
+	}); err != nil {
 		return err
 	}
 	return nil
@@ -113,15 +131,54 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 		}
 	}
 
-	// 2. Load Balancer / Endpoint
-	var lbIP string
+	// 1.5 Ensure External APIServer (New Architecture)
 	{
-		defer m.measure("Load Balancer Reservation")()
-		klog.Infof("  > Reserving Regional External Passthrough Load Balancer IP...")
-		// Use Control Plane region
-		lbIP, err = m.gce.EnsureStaticIP(ctx, fmt.Sprintf("%s-api", cfg.Metadata.Name), cfg.Spec.ControlPlane.Region)
+		defer m.measure("Ensure External APIServer")()
+
+		if len(cfg.Spec.Networks) == 0 {
+			return fmt.Errorf("no networks defined in spec")
+		}
+
+		netName := cfg.Spec.Networks[0].Name
+		subName := ""
+		if len(cfg.Spec.Networks[0].Subnets) > 0 {
+			subName = cfg.Spec.Networks[0].Subnets[0].Name
+		} else {
+			subName = netName // Auto mode?
+		}
+
+		// We need a Zone.
+		zone := cfg.Spec.ControlPlane.Zone
+		if zone == "" {
+			zone = m.gce.GetDefaultZone(ctx)
+		}
+		if zone == "" {
+			// Fallback or error?
+			klog.Warning("No zone specified for External APIServer, guessing us-central1-a")
+			zone = "us-central1-a"
+		}
+
+		ep, err := m.EnsureExternalAPIServer(ctx, cfg, zone, netName, subName)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to ensure external apiserver: %v", err)
+		}
+		// Parse the endpoint IP into a URL
+		u, err := url.Parse(fmt.Sprintf("https://%s:6443", ep))
+		if err != nil {
+			return fmt.Errorf("failed to parse external apiserver url: %v", err)
+		}
+		cfg.Spec.ExternalAPIServer = u
+	}
+
+	// 2. Load Balancer / Endpoint
+	klog.Infof("  > Using External APIServer at %s", cfg.Spec.ExternalAPIServer.String())
+	// 6. Wait for Control Plane Ready
+	{
+		defer m.measure("Wait for API Server")()
+		klog.Infof("  > Waiting for Kubernetes API Server (%s:6443) to be ready...", cfg.Spec.ExternalAPIServer.String())
+		timeout := 5 * time.Minute
+		if err := m.waitForAPIServer(ctx, cfg.Spec.ExternalAPIServer, timeout); err != nil {
+			return fmt.Errorf("control plane failed to initialize after %v: %v", timeout, err)
 		}
 	}
 
@@ -148,7 +205,7 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 
 	templateData := map[string]interface{}{
 		"ClusterName":           cfg.Metadata.Name,
-		"ControlPlaneEndpoint":  lbIP,
+		"ControlPlaneEndpoint":  cfg.Spec.ExternalAPIServer,
 		"KubernetesVersion":     cfg.Spec.Kubernetes.Version,
 		"KubernetesRepoVersion": repoVer,
 		"PodSubnet":             cfg.Spec.Kubernetes.Networking.PodCIDR,
@@ -179,6 +236,9 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 	}
 
 	// Construct the CP startup script
+	// apiserver and etcd are already running in the external apiserver
+	kubeadmArgs := "--upload-certs --ignore-preflight-errors=NumCPU --skip-phases=etcd,control-plane/apiserver"
+
 	cpStartupScript := fmt.Sprintf(`%s
 
 # ---------------------------------------------------------
@@ -191,10 +251,10 @@ cat <<EOF > /etc/kubernetes/kubeadm-config.yaml
 EOF
 
 echo "👑 kingc: Running kubeadm init..."
-kubeadm init --config /etc/kubernetes/kubeadm-config.yaml --upload-certs --ignore-preflight-errors=NumCPU
+kubeadm init --config /etc/kubernetes/kubeadm-config.yaml %s
 
 echo "👑 kingc: Control Plane Initialized"
-`, baseInstallScript, kubeadmConfig)
+`, baseInstallScript, kubeadmConfig, kubeadmArgs)
 
 	tmpCPStartup := filepath.Join(tmpDir, "cp-startup.sh")
 	if err := os.WriteFile(tmpCPStartup, []byte(cpStartupScript), 0644); err != nil {
@@ -235,52 +295,6 @@ echo "👑 kingc: Control Plane Initialized"
 			klog.Warningf("    (Instance warning: %v)", err)
 		}
 
-		// 5b. Configure Regional Load Balancer Logic
-		klog.Infof("  > Configuring Regional Load Balancer...")
-		baseName := basename(cfg.Metadata.Name)
-		region := cfg.Spec.ControlPlane.Region
-		hcName := baseName + "-hc"
-		bsName := baseName + "-bs"
-		frName := baseName + "-fr"
-		igName := baseName + "-cp-ig" // Unmanaged Instance Group for CP
-
-		// Health Check
-		if err := m.gce.CreateRegionHealthCheck(ctx, hcName, region); err != nil {
-			klog.Warningf("    (HC warning: %v)", err)
-		}
-
-		// Instance Group (Unmanaged)
-		if err := m.gce.CreateUnmanagedInstanceGroup(ctx, igName, cpZone); err != nil {
-			klog.Warningf("    (IG warning: %v)", err)
-		}
-		// Add instance to IG
-		if err := m.gce.AddInstancesToGroup(ctx, igName, cpZone, cpName); err != nil {
-			klog.Warningf("    (AddInstance warning: %v)", err)
-		}
-
-		// Backend Service
-		if err := m.gce.CreateRegionBackendService(ctx, bsName, region, hcName); err != nil {
-			klog.Warningf("    (BS warning: %v)", err)
-		}
-		// Add Backend
-		if err := m.gce.AddRegionBackend(ctx, bsName, region, igName, cpZone); err != nil {
-			klog.Warningf("    (AddBackend warning: %v)", err)
-		}
-
-		// Forwarding Rule
-		if err := m.gce.CreateRegionForwardingRule(ctx, frName, region, bsName, lbIP); err != nil {
-			klog.Warningf("    (FR warning: %v)", err)
-		}
-	}
-
-	// 6. Wait for Control Plane Ready
-	{
-		defer m.measure("Wait for API Server")()
-		klog.Infof("  > Waiting for Kubernetes API Server (%s:6443) to be ready...", lbIP)
-		timeout := 5 * time.Minute
-		if err := m.waitForAPIServer(ctx, lbIP, timeout); err != nil {
-			return fmt.Errorf("control plane failed to initialize after %v: %v", timeout, err)
-		}
 	}
 
 	// 7. Fetch Kubeconfig
@@ -446,87 +460,7 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 
 	var errs []error
 
-	// 1. Delete Regional LB Resources (Dependencies for Instance Groups)
-	var instances []gce.Instance
-	var addresses []gce.Address
-	{
-		defer m.measure("LB Resources Cleanup")()
-		baseName := basename(name)
-		addressName := baseName + "-api"
-
-		// Gather regions from all possible regional resources
-		targetRegions := make(map[string]bool)
-
-		// A. Check Addresses
-		var err error
-		addresses, err = m.gce.ListAddresses(ctx, "name="+addressName)
-		if err != nil {
-			klog.Warningf("    ⚠️  Failed to list addresses: %v", err)
-		} else {
-			for _, addr := range addresses {
-				if addr.Region != "" {
-					targetRegions[addr.Region] = true
-				}
-			}
-		}
-
-		// B. Check Forwarding Rules
-		frs, err := m.gce.ListForwardingRules(ctx, "name:"+baseName+"*")
-		if err != nil {
-			klog.Warningf("    ⚠️  Failed to list forwarding rules: %v", err)
-		} else {
-			for _, fr := range frs {
-				if fr.Region != "" {
-					targetRegions[fr.Region] = true
-				}
-			}
-		}
-
-		// C. Check Backend Services
-		bss, err := m.gce.ListBackendServices(ctx, "name:"+baseName+"*")
-		if err != nil {
-			klog.Warningf("    ⚠️  Failed to list backend services: %v", err)
-		} else {
-			for _, bs := range bss {
-				if bs.Region != "" {
-					targetRegions[bs.Region] = true
-				}
-			}
-		}
-
-		// We also verify instances to find regions if address is missing
-		tags := []string{basename(name)}
-		instances, err = m.gce.ListInstances(ctx, tags)
-		if err != nil {
-			klog.Warningf("    ⚠️  Failed to list instances: %v", err)
-		} else {
-			for _, inst := range instances {
-				if len(inst.Zone) > 2 {
-					reg := inst.Zone[:len(inst.Zone)-2]
-					targetRegions[reg] = true
-				}
-			}
-		}
-
-		for region := range targetRegions {
-			klog.Infof("  > Cleaning up LB Resources in %s...", region)
-			// FR
-			if err := m.gce.DeleteRegionForwardingRule(ctx, baseName+"-fr", region); err != nil && !gce.IsNotFoundError(err) {
-				klog.V(4).Infof("Ignored error deleting forwarding rule: %v", err)
-			}
-			// BS
-			if err := m.gce.DeleteRegionBackendService(ctx, baseName+"-bs", region); err != nil && !gce.IsNotFoundError(err) {
-				klog.V(4).Infof("Ignored error deleting backend service: %v", err)
-			}
-			// HC
-			if err := m.gce.DeleteRegionHealthCheck(ctx, baseName+"-hc", region); err != nil && !gce.IsNotFoundError(err) {
-				klog.V(4).Infof("Ignored error deleting health check: %v", err)
-			}
-			klog.Infof("    ✅ Done (Best Effort)")
-		}
-	}
-
-	// 2. Delete Instance Groups
+	// Delete Instance Groups
 	{
 		defer m.measure("Instance Groups Cleanup")()
 		klog.Infof("  > Cleaning up Instance Groups...")
@@ -558,10 +492,15 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 		}
 	}
 
-	// 3. Delete Remaining Instances
+	// Delete Remaining Instances
 	{
 		defer m.measure("Instances Cleanup")()
-		if len(instances) > 0 {
+		// We also verify instances to find regions if address is missing
+		tags := []string{basename(name)}
+		instances, err := m.gce.ListInstances(ctx, tags)
+		if err != nil {
+			klog.Warningf("    ⚠️  Failed to list instances: %v", err)
+		} else {
 			for _, inst := range instances {
 				klog.Infof("  > Deleting Instance %s in %s...", inst.Name, inst.Zone)
 				if _, err := m.gce.Run(ctx, "compute", "instances", "delete", inst.Name, "--zone", inst.Zone, "--quiet"); err != nil && !gce.IsNotFoundError(err) {
@@ -574,21 +513,7 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 		}
 	}
 
-	// 4. Delete Addresses
-	{
-		defer m.measure("Address Cleanup")()
-		for _, addr := range addresses {
-			klog.Infof("  > Deleting Address %s...", addr.Name)
-			if err := m.gce.DeleteAddress(ctx, addr.Name, addr.Region); err != nil && !gce.IsNotFoundError(err) {
-				klog.Warningf("    ⚠️  Failed: %v", err)
-				errs = append(errs, fmt.Errorf("delete address %s: %w", addr.Name, err))
-			} else {
-				klog.Infof("    ✅ Done")
-			}
-		}
-	}
-
-	// 5. Delete Firewall Rules
+	// Delete Firewall Rules
 	// Check if rules exist by trying to delete them and ignoring NotFound
 	{
 		defer m.measure("Firewall Rules Cleanup")()
@@ -625,8 +550,8 @@ func (m *Manager) renderTemplate(path string, data interface{}) (string, error) 
 	return buf.String(), nil
 }
 
-func (m *Manager) waitForAPIServer(ctx context.Context, ip string, timeout time.Duration) error {
-	url := fmt.Sprintf("https://%s/healthz", net.JoinHostPort(ip, "6443"))
+func (m *Manager) waitForAPIServer(ctx context.Context, uri *url.URL, timeout time.Duration) error {
+	url := fmt.Sprintf("https://%s/healthz", uri.String())
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
@@ -798,7 +723,6 @@ func untar(dst string, r io.Reader) error {
 		case header == nil:
 			continue
 		}
-
 		target := filepath.Join(dst, header.Name)
 		switch header.Typeflag {
 		case tar.TypeDir:
@@ -810,18 +734,7 @@ func untar(dst string, r io.Reader) error {
 		case tar.TypeReg:
 			f, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
 			if err != nil {
-				// Try creating dir if missing (sometimes tar entries order varies)
-				if os.IsNotExist(err) {
-					if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
-						return err
-					}
-					f, err = os.OpenFile(target, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
-					if err != nil {
-						return err
-					}
-				} else {
-					return err
-				}
+				return err
 			}
 			if _, err := io.Copy(f, tr); err != nil {
 				_ = f.Close()
@@ -830,4 +743,175 @@ func untar(dst string, r io.Reader) error {
 			_ = f.Close()
 		}
 	}
+}
+
+func (m *Manager) EnsureExternalAPIServer(ctx context.Context, cfg *config.Cluster, zone, network, subnet string) (string, error) {
+	name := fmt.Sprintf("%s-apiserver", basename(cfg.Metadata.Name))
+
+	// Assume image is in the current project's GCR
+	image := config.DefaultAPIServerImage
+
+	klog.Infof("  > Ensuring External APIServer instance %s (Image: %s)...", name, image)
+
+	// Check if already exists
+	ip, err := m.gce.EnsureStaticIP(ctx, name, cfg.Spec.Region)
+	if err != nil {
+		return "", err
+	}
+
+	// --- PKI Setup with Google CAS ---
+	klog.Infof("  > Configuring Public Key Infrastructure (Google CAS)...")
+	casRegion := cfg.Spec.Region // Use same region for CAS
+	poolID := fmt.Sprintf("kingc-pool-%s", cfg.Metadata.Name)
+	caID := fmt.Sprintf("kingc-ca-%s", cfg.Metadata.Name)
+
+	// 1. Ensure Pool
+	if err := m.gce.CreateCASPool(ctx, poolID, casRegion); err != nil {
+		return "", fmt.Errorf("failed to create CAS pool: %v", err)
+	}
+	// 2. Ensure Root CA
+	if err := m.gce.CreateCASRootCA(ctx, poolID, casRegion, caID, "kingc-ca"); err != nil {
+		return "", fmt.Errorf("failed to create CAS Root CA: %v", err)
+	}
+
+	// 3. Generate CSR for API Server
+	// Generate local key
+	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate rsa key: %v", err)
+	}
+	keyBytes := x509.MarshalPKCS1PrivateKey(privKey)
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: keyBytes})
+
+	// CSR
+	subj := pkix.Name{
+		CommonName:   "kube-apiserver",
+		Organization: []string{"kingc"},
+	}
+	// Add SANs: Localhhost, IP, kubernetes service IP
+	dnsNames := []string{
+		"kubernetes",
+		"kubernetes.default",
+		"kubernetes.default.svc",
+		"kubernetes.default.svc.cluster.local",
+		"localhost",
+		name,
+	}
+	// Calculate the first IP of the Service CIDR (e.g. 10.96.0.1 for 10.96.0.0/12)
+	svcPrefix, err := netip.ParsePrefix(cfg.Spec.Kubernetes.Networking.ServiceCIDR)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse service cidr: %v", err)
+	}
+	svcIP := svcPrefix.Addr().Next() // First IP is usually gateway/apiserver
+
+	ips := []net.IP{
+		net.ParseIP(ip),
+		net.ParseIP("127.0.0.1"),
+		net.ParseIP(svcIP.String()),
+	}
+
+	template := x509.CertificateRequest{
+		Subject:     subj,
+		DNSNames:    dnsNames,
+		IPAddresses: ips,
+	}
+	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, &template, privKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to create CSR: %v", err)
+	}
+	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrBytes})
+
+	// 4. Sign CSR
+	certPEM, err := m.gce.SignCASCertificate(ctx, csrPEM, poolID, casRegion, caID)
+	if err != nil {
+		return "", fmt.Errorf("failed to sign certificate: %v", err)
+	}
+
+	// 4.5 Get Root CA
+	caPEM, err := m.gce.GetCASRootCertificate(ctx, poolID, casRegion, caID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get root CA: %v", err)
+	}
+
+	// 5. Setup Service Account Keys
+	// CAS is not used for SA keys (JWT signing), so we generate them locally.
+	// We generate them here ensuring the Manager is the source of truth.
+	saPrivKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate sa key: %v", err)
+	}
+	saKeyBytes := x509.MarshalPKCS1PrivateKey(saPrivKey)
+	saKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: saKeyBytes})
+
+	saPubKeyBytes, err := x509.MarshalPKIXPublicKey(&saPrivKey.PublicKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal sa public key: %v", err)
+	}
+	saPubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: saPubKeyBytes})
+
+	// 6. Embed generic startup script
+	startupScript := `#! /bin/bash
+mkdir -p /var/lib/kingc/pki
+cd /var/lib/kingc/pki
+# Generate Tokens
+if [ ! -f tokens.csv ]; then
+    echo "admin-token,admin,uid,system:masters" > tokens.csv
+fi
+chmod 600 *
+`
+	mounts := []string{
+		"host-path=/var/lib/kingc/pki,mount-path=/var/run/kubernetes,mode=rw",
+	}
+
+	// Append to startup script to write certs and keys
+	startupScript += fmt.Sprintf(`
+echo "%s" > /var/lib/kingc/pki/apiserver.key
+echo "%s" > /var/lib/kingc/pki/apiserver.crt
+echo "%s" > /var/lib/kingc/pki/ca.crt
+echo "%s" > /var/lib/kingc/pki/sa.key
+echo "%s" > /var/lib/kingc/pki/sa.pub
+`, string(keyPEM), string(certPEM), string(caPEM), string(saKeyPEM), string(saPubPEM))
+
+	args := []string{
+		"--secure-port=6443",
+		"--service-cluster-ip-range=" + cfg.Spec.Kubernetes.Networking.ServiceCIDR,
+		"--service-account-key-file=/var/run/kubernetes/sa.pub",
+		"--service-account-signing-key-file=/var/run/kubernetes/sa.key",
+		"--service-account-issuer=https://kubernetes.default.svc.cluster.local",
+		"--token-auth-file=/var/run/kubernetes/tokens.csv",
+		"--authorization-mode=Node,RBAC",
+		"--advertise-address=" + ip,
+		"--tls-cert-file=/var/run/kubernetes/apiserver.crt",
+		"--tls-private-key-file=/var/run/kubernetes/apiserver.key",
+		"--client-ca-file=/var/run/kubernetes/ca.crt",
+	}
+
+	meta := map[string]string{
+		"startup-script": startupScript,
+	}
+
+	tags := []string{basename(cfg.Metadata.Name), "kingc-role-apiserver"}
+
+	// Create Instance
+	err = m.gce.CreateContainerInstance(
+		ctx,
+		name, zone, cfg.Spec.ControlPlane.MachineType,
+		network, subnet,
+		image,
+		mounts,
+		nil, // env
+		args,
+		ip, // address
+		tags,
+		meta,
+	)
+	if err != nil {
+		if strings.Contains(err.Error(), "already exists") {
+			klog.Infof("    Instance %s already exists", name)
+		} else {
+			return "", err
+		}
+	}
+
+	return ip, nil
 }

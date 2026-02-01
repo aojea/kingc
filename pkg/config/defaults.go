@@ -25,8 +25,9 @@ const (
 	DefaultControlPlaneName = "control-plane"
 	DefaultWorkerGroupName  = "workers"
 
-	DefaultImageProject = "ubuntu-os-cloud"
-	DefaultImageFamily  = "ubuntu-2204-lts"
+	DefaultImageProject   = "ubuntu-os-cloud"
+	DefaultImageFamily    = "ubuntu-2204-lts"
+	DefaultAPIServerImage = "aojea/kingc-apiserver:latest"
 )
 
 // SetDefaults applies default values to the configuration
