@@ -553,7 +553,12 @@ func (m *Manager) renderTemplate(path string, data interface{}) (string, error) 
 }
 
 func (m *Manager) waitForAPIServer(ctx context.Context, uri *url.URL, timeout time.Duration) error {
-	url := fmt.Sprintf("https://%s/healthz", uri.String())
+	// uri already contains scheme (https), so just append path.
+	// We handle the url package shadowing by using a different variable name.
+	target := *uri
+	target.Path = "/healthz"
+	healthURL := target.String()
+
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
@@ -567,11 +572,11 @@ func (m *Manager) waitForAPIServer(ctx context.Context, uri *url.URL, timeout ti
 		default:
 		}
 		if time.Since(start) > timeout {
-			return fmt.Errorf("timed out waiting for API server at %s", url)
+			return fmt.Errorf("timed out waiting for API server at %s", healthURL)
 		}
 
 		// Create request with context to respect cancellation during request
-		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", healthURL, nil)
 		if err == nil {
 			resp, err := client.Do(req)
 			if err == nil {
