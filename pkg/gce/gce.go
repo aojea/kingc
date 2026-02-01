@@ -27,17 +27,27 @@ func (c *Client) Run(ctx context.Context, args ...string) (string, error) {
 	return string(out), nil
 }
 
-func IsAlreadyExistsError(err error) bool {
-	if err == nil {
-		return false
+// RunQuiet executes a command and returns only its stdout.
+// Stderr is ignored/discarded to prevent pollution of JSON output with warnings.
+func (c *Client) RunQuiet(ctx context.Context, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "gcloud", args...)
+	cmd.Env = os.Environ()
+	// We only want Stdout
+	out, err := cmd.Output()
+	if err != nil {
+		// If exit error, we might want to capture stderr for debugging?
+		// But cmd.Output() returns exit error which doesn't include stderr by default.
+		// Let's rely on the fact that if it failed, we return error.
+		// If we want stderr in error message, we need to capture it separately.
+		return "", fmt.Errorf("command failed: gcloud %s: %v", strings.Join(args, " "), err)
 	}
-	return strings.Contains(err.Error(), "already exists")
+	return string(out), nil
 }
 
 // RunJSON executes a gcloud command and unmarshals the output into the provided struct
 func (c *Client) RunJSON(ctx context.Context, v interface{}, args ...string) error {
 	args = append(args, "--format=json")
-	out, err := c.Run(ctx, args...)
+	out, err := c.RunQuiet(ctx, args...)
 	if err != nil {
 		return err
 	}
@@ -306,6 +316,26 @@ func (c *Client) CreateRegionBackendService(ctx context.Context, name, region, h
 	return err
 }
 
+type BackendService struct {
+	Name   string `json:"name"`
+	Region string `json:"region"`
+}
+
+func (c *Client) ListBackendServices(ctx context.Context, filter string) ([]BackendService, error) {
+	var services []BackendService
+	err := c.RunJSON(ctx, &services, "compute", "backend-services", "list", "--filter", filter)
+	if err != nil {
+		return nil, err
+	}
+	for i := range services {
+		if services[i].Region != "" {
+			parts := strings.Split(services[i].Region, "/")
+			services[i].Region = parts[len(parts)-1]
+		}
+	}
+	return services, nil
+}
+
 func (c *Client) AddRegionBackend(ctx context.Context, service, region, group, groupZone string) error {
 	_, err := c.Run(ctx, "compute", "backend-services", "add-backend", service, "--region", region, "--instance-group", group, "--instance-group-zone", groupZone)
 	return err
@@ -314,6 +344,26 @@ func (c *Client) AddRegionBackend(ctx context.Context, service, region, group, g
 func (c *Client) CreateRegionForwardingRule(ctx context.Context, name, region, service, address string) error {
 	_, err := c.Run(ctx, "compute", "forwarding-rules", "create", name, "--region", region, "--backend-service", service, "--address", address, "--ports", "6443")
 	return err
+}
+
+type ForwardingRule struct {
+	Name   string `json:"name"`
+	Region string `json:"region"`
+}
+
+func (c *Client) ListForwardingRules(ctx context.Context, filter string) ([]ForwardingRule, error) {
+	var rules []ForwardingRule
+	err := c.RunJSON(ctx, &rules, "compute", "forwarding-rules", "list", "--filter", filter)
+	if err != nil {
+		return nil, err
+	}
+	for i := range rules {
+		if rules[i].Region != "" {
+			parts := strings.Split(rules[i].Region, "/")
+			rules[i].Region = parts[len(parts)-1]
+		}
+	}
+	return rules, nil
 }
 
 func (c *Client) DeleteRegionForwardingRule(ctx context.Context, name, region string) error {

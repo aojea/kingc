@@ -317,7 +317,81 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 
 	var errs []error
 
-	// 1. Delete Instance Groups
+	// 1. Delete Regional LB Resources (Dependencies for Instance Groups)
+	baseName := name
+	addressName := baseName + "-api"
+
+	// Gather regions from all possible regional resources
+	targetRegions := make(map[string]bool)
+
+	// A. Check Addresses
+	addresses, err := m.gce.ListAddresses(ctx, "name="+addressName)
+	if err != nil {
+		klog.Warningf("    ⚠️  Failed to list addresses: %v", err)
+	} else {
+		for _, addr := range addresses {
+			if addr.Region != "" {
+				targetRegions[addr.Region] = true
+			}
+		}
+	}
+
+	// B. Check Forwarding Rules
+	frs, err := m.gce.ListForwardingRules(ctx, "name:"+baseName+"*")
+	if err != nil {
+		klog.Warningf("    ⚠️  Failed to list forwarding rules: %v", err)
+	} else {
+		for _, fr := range frs {
+			if fr.Region != "" {
+				targetRegions[fr.Region] = true
+			}
+		}
+	}
+
+	// C. Check Backend Services
+	bss, err := m.gce.ListBackendServices(ctx, "name:"+baseName+"*")
+	if err != nil {
+		klog.Warningf("    ⚠️  Failed to list backend services: %v", err)
+	} else {
+		for _, bs := range bss {
+			if bs.Region != "" {
+				targetRegions[bs.Region] = true
+			}
+		}
+	}
+
+	// D. Check Instances
+	tags := []string{"kingc-cluster-" + name}
+	instances, err := m.gce.ListInstances(ctx, tags)
+	if err != nil {
+		klog.Warningf("    ⚠️  Failed to list instances: %v", err)
+	} else {
+		for _, inst := range instances {
+			if len(inst.Zone) > 2 {
+				reg := inst.Zone[:len(inst.Zone)-2]
+				targetRegions[reg] = true
+			}
+		}
+	}
+
+	for region := range targetRegions {
+		klog.Infof("  > Cleaning up LB Resources in %s...", region)
+		// FR
+		if err := m.gce.DeleteRegionForwardingRule(ctx, baseName+"-fr", region); err != nil && !gce.IsNotFoundError(err) {
+			klog.V(4).Infof("Ignored error deleting forwarding rule: %v", err)
+		}
+		// BS
+		if err := m.gce.DeleteRegionBackendService(ctx, baseName+"-bs", region); err != nil && !gce.IsNotFoundError(err) {
+			klog.V(4).Infof("Ignored error deleting backend service: %v", err)
+		}
+		// HC
+		if err := m.gce.DeleteRegionHealthCheck(ctx, baseName+"-hc", region); err != nil && !gce.IsNotFoundError(err) {
+			klog.V(4).Infof("Ignored error deleting health check: %v", err)
+		}
+		klog.Infof("    ✅ Done (Best Effort)")
+	}
+
+	// 2. Delete Instance Groups
 	klog.Infof("  > Cleaning up Instance Groups...")
 	filter := fmt.Sprintf("name:%s*", name)
 	groups, err := m.gce.ListInstanceGroups(ctx, filter)
@@ -328,7 +402,7 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 		for _, g := range groups {
 			if strings.Contains(g.Name, "mig") {
 				klog.Infof("  > Deleting MIG %s in %s...", g.Name, g.Zone)
-				if err := m.gce.DeleteMIG(ctx, g.Name, g.Zone); err != nil {
+				if err := m.gce.DeleteMIG(ctx, g.Name, g.Zone); err != nil && !gce.IsNotFoundError(err) {
 					klog.Warningf("    ⚠️  Failed: %v", err)
 					errs = append(errs, fmt.Errorf("delete MIG %s: %w", g.Name, err))
 				} else {
@@ -336,7 +410,7 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 				}
 			} else {
 				klog.Infof("  > Deleting Unmanaged IG %s in %s...", g.Name, g.Zone)
-				if err := m.gce.DeleteUnmanagedInstanceGroup(ctx, g.Name, g.Zone); err != nil {
+				if err := m.gce.DeleteUnmanagedInstanceGroup(ctx, g.Name, g.Zone); err != nil && !gce.IsNotFoundError(err) {
 					klog.Warningf("    ⚠️  Failed: %v", err)
 					errs = append(errs, fmt.Errorf("delete IG %s: %w", g.Name, err))
 				} else {
@@ -346,16 +420,11 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 		}
 	}
 
-	// 2. Delete Remaining Instances
-	tags := []string{"kingc-cluster-" + name}
-	instances, err := m.gce.ListInstances(ctx, tags)
-	if err != nil {
-		klog.Errorf("⚠️  Error listing instances: %v\n", err)
-		errs = append(errs, err)
-	} else {
+	// 3. Delete Remaining Instances
+	if len(instances) > 0 {
 		for _, inst := range instances {
 			klog.Infof("  > Deleting Instance %s in %s...", inst.Name, inst.Zone)
-			if _, err := m.gce.Run(ctx, "compute", "instances", "delete", inst.Name, "--zone", inst.Zone, "--quiet"); err != nil {
+			if _, err := m.gce.Run(ctx, "compute", "instances", "delete", inst.Name, "--zone", inst.Zone, "--quiet"); err != nil && !gce.IsNotFoundError(err) {
 				klog.Warningf("    ⚠️  Failed: %v", err)
 				errs = append(errs, fmt.Errorf("delete instance %s: %w", inst.Name, err))
 			} else {
@@ -364,51 +433,10 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 		}
 	}
 
-	// 3. Delete Regional LB Resources
-	baseName := name
-	addressName := baseName + "-api"
-
-	addresses, err := m.gce.ListAddresses(ctx, "name="+addressName)
-	if err != nil {
-		klog.Errorf("⚠️  Error listing addresses: %v\n", err)
-		errs = append(errs, err)
-	}
-
-	targetRegions := make(map[string]bool)
-	for _, addr := range addresses {
-		if addr.Region != "" {
-			targetRegions[addr.Region] = true
-		}
-	}
-	// Fallback to instance zones/regions
-	for _, inst := range instances {
-		if len(inst.Zone) > 2 {
-			reg := inst.Zone[:len(inst.Zone)-2]
-			targetRegions[reg] = true
-		}
-	}
-
-	for region := range targetRegions {
-		klog.Infof("  > Cleaning up LB Resources in %s...", region)
-		// FR
-		if err := m.gce.DeleteRegionForwardingRule(ctx, baseName+"-fr", region); err != nil {
-			klog.V(4).Infof("Ignored error deleting forwarding rule: %v", err)
-		}
-		// BS
-		if err := m.gce.DeleteRegionBackendService(ctx, baseName+"-bs", region); err != nil {
-			klog.V(4).Infof("Ignored error deleting backend service: %v", err)
-		}
-		// HC
-		if err := m.gce.DeleteRegionHealthCheck(ctx, baseName+"-hc", region); err != nil {
-			klog.V(4).Infof("Ignored error deleting health check: %v", err)
-		}
-		klog.Infof("    ✅ Done (Best Effort)")
-	}
-
 	// 4. Delete Addresses
 	for _, addr := range addresses {
 		klog.Infof("  > Deleting Address %s...", addr.Name)
-		if err := m.gce.DeleteAddress(ctx, addr.Name, addr.Region); err != nil {
+		if err := m.gce.DeleteAddress(ctx, addr.Name, addr.Region); err != nil && !gce.IsNotFoundError(err) {
 			klog.Warningf("    ⚠️  Failed: %v", err)
 			errs = append(errs, fmt.Errorf("delete address %s: %w", addr.Name, err))
 		} else {
@@ -417,9 +445,12 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 	}
 
 	// 5. Delete Firewall Rules
+	// Check if rules exist by trying to delete them and ignoring NotFound
 	klog.Infof("  > Deleting Firewall Rules...")
 	rules := []string{name + "-internal", name + "-external"}
-	if _, err := m.gce.Run(ctx, "compute", "firewall-rules", "delete", strings.Join(rules, " "), "--quiet"); err != nil {
+	fwArgs := append([]string{"compute", "firewall-rules", "delete"}, rules...)
+	fwArgs = append(fwArgs, "--quiet")
+	if _, err := m.gce.Run(ctx, fwArgs...); err != nil && !gce.IsNotFoundError(err) {
 		klog.Warningf("    ⚠️  Failed: %v", err)
 		errs = append(errs, fmt.Errorf("delete firewall rules: %w", err))
 	} else {
