@@ -257,6 +257,32 @@ func (c *Client) CreateMIG(name, template, zone string, size int) error {
 	return err
 }
 
+type Group struct {
+	Name string `json:"name"`
+	Zone string `json:"zone"`
+}
+
+func (c *Client) ListInstanceGroups(filter string) ([]Group, error) {
+	var groups []Group
+	// List both managed and unmanaged? Or just managed?
+	// `gcloud compute instance-groups list` lists both.
+	err := c.RunJSON(&groups, "compute", "instance-groups", "list", "--filter", filter)
+	if err != nil {
+		return nil, err
+	}
+	// Normalize zones
+	for i := range groups {
+		parts := strings.Split(groups[i].Zone, "/")
+		groups[i].Zone = parts[len(parts)-1]
+	}
+	return groups, nil
+}
+
+func (c *Client) DeleteMIG(name, zone string) error {
+	_, err := c.Run("compute", "instance-groups", "managed", "delete", name, "--zone", zone, "--quiet")
+	return err
+}
+
 func (c *Client) CreateUnmanagedInstanceGroup(name, zone string) error {
 	// check if exists first? gcloud usually errors if exists
 	_, err := c.Run("compute", "instance-groups", "unmanaged", "create", name, "--zone", zone)
