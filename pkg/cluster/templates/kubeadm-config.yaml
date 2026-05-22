@@ -31,13 +31,20 @@ apiServer:
   - 127.0.0.1
   extraArgs:
     runtime-config: "{{ .RuntimeConfig }}"
+    bind-address: "0.0.0.0"
 controllerManager:
   extraArgs:
     cloud-provider: "external"
-    cluster-signing-cert-file: "/etc/kubernetes/pki/node-ca.crt"
-    cluster-signing-key-file: "/etc/kubernetes/pki/node-ca.key"
 scheduler:
   extraArgs:
+etcd:
+  local:
+    extraArgs:
+      listen-client-urls: "https://127.0.0.1:2379"
+      listen-peer-urls: "https://127.0.0.1:2380"
+      advertise-client-urls: "https://127.0.0.1:2379"
+      initial-advertise-peer-urls: "https://127.0.0.1:2380"
+      initial-cluster: "{{ .ClusterName }}-cp=https://127.0.0.1:2380"
 networking:
   dnsDomain: cluster.local
   podSubnet: "{{ .PodSubnet }}"

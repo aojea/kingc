@@ -47,3 +47,11 @@ echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.
 apt-get update
 apt-get install -y kubelet kubeadm kubectl
 apt-mark hold kubelet kubeadm kubectl
+
+# Install cri-tools (crictl)
+curl -L "https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz" -o crictl.tar.gz
+tar zxvf crictl.tar.gz -C /usr/local/bin
+rm -f crictl.tar.gz
+
+# Create crictl config
+echo "runtime-endpoint: unix:///run/containerd/containerd.sock" > /etc/crictl.yaml

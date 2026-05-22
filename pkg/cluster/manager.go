@@ -3,9 +3,11 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"embed"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -65,8 +67,6 @@ func (m *Manager) Preflight(ctx context.Context) error {
 	// 'privateca.googleapis.com' for private certificate authority.
 	if err := m.gce.CheckServicesEnabled(ctx, []string{
 		"compute.googleapis.com",
-		"certificatemanager.googleapis.com",
-		"privateca.googleapis.com",
 	}); err != nil {
 		return err
 	}
@@ -142,77 +142,138 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 		return err
 	}
 
-	// 1.5 Ensure External APIServer (New Architecture)
-	var caCert, saPub, saKey, signingKey, signingCert, frontProxyCACert []byte
+	// 1.5 Reserve Static IP for Control Plane VM
+	var cpName, cpZone, cpNet, cpSub string
+	var cpIP string
 	var localKubeconfig string
-	var adminKubeconfig, schedulerKubeconfig, cmKubeconfig string
+	if len(cfg.Spec.Networks) == 0 {
+		return fmt.Errorf("no networks defined in spec")
+	}
+	cpNet = cfg.Spec.Networks[0].Name
+	cpSub, err = resolveSubnet(cfg.Spec.Networks, cpNet, "")
+	if err != nil {
+		return fmt.Errorf("resolving CP network: %v", err)
+	}
+	cpZone = cfg.Spec.ControlPlane.Zone
+	if cpZone == "" {
+		cpZone = m.gce.GetDefaultZone(ctx)
+	}
+	if cpZone == "" {
+		cpZone = "us-central1-a"
+	}
+	cpName = fmt.Sprintf("%s-cp", cfg.Metadata.Name)
 
-	if err := func() error {
-		defer m.measure("Ensure External APIServer")()
+	klog.Infof("  > Reserving static IP for Control Plane VM...")
+	cpIP, err = m.gce.EnsureStaticIP(ctx, cpName, cfg.Spec.Region)
+	if err != nil {
+		return fmt.Errorf("failed to ensure static IP for control plane: %v", err)
+	}
 
-		if len(cfg.Spec.Networks) == 0 {
-			return fmt.Errorf("no networks defined in spec")
+	// Parse the control plane endpoint IP into a URL
+	u, err := url.Parse(fmt.Sprintf("https://%s", net.JoinHostPort(cpIP, "6443")))
+	if err != nil {
+		return fmt.Errorf("failed to parse control plane url: %v", err)
+	}
+	cfg.Spec.ExternalAPIServer = u
+
+	// 2. Generate Bootstrap Token
+	tokenID := randString(6)
+	tokenSecret := randString(16)
+	bootstrapToken := fmt.Sprintf("%s.%s", tokenID, tokenSecret)
+
+	// 3. Format RuntimeConfig
+	var rcBuilder strings.Builder
+	firstRC := true
+	for k, v := range cfg.Spec.RuntimeConfig {
+		if !firstRC {
+			rcBuilder.WriteString(",")
 		}
+		rcBuilder.WriteString(fmt.Sprintf("%s=%s", k, v))
+		firstRC = false
+	}
 
-		netName := cfg.Spec.Networks[0].Name
-		subName := ""
-		if len(cfg.Spec.Networks[0].Subnets) > 0 {
-			subName = cfg.Spec.Networks[0].Subnets[0].Name
-		} else {
-			subName = netName // Auto mode?
-		}
+	repoVer := cfg.Spec.Kubernetes.Version
+	parts := strings.Split(repoVer, ".")
+	if len(parts) >= 2 {
+		repoVer = strings.Join(parts[:2], ".")
+	}
 
-		// We need a Zone.
-		zone := cfg.Spec.ControlPlane.Zone
-		if zone == "" {
-			zone = m.gce.GetDefaultZone(ctx)
-		}
-		if zone == "" {
-			// Fallback or error?
-			klog.Warning("No zone specified for External APIServer, guessing us-central1-a")
-			zone = "us-central1-a"
-		}
+	templateData := map[string]interface{}{
+		"ClusterName":              cfg.Metadata.Name,
+		"ControlPlaneEndpoint":     cfg.Spec.ExternalAPIServer.Host,
+		"ControlPlaneIP":           cfg.Spec.ExternalAPIServer.Hostname(),
+		"KubernetesVersion":        cfg.Spec.Kubernetes.Version,
+		"KubernetesRepoVersion":    repoVer,
+		"PodSubnet":                cfg.Spec.Kubernetes.Networking.PodCIDR,
+		"ServiceSubnet":            cfg.Spec.Kubernetes.Networking.ServiceCIDR,
+		"KindnetImage":             "registry.k8s.io/networking/kindnet:v1.0.0",
+		"CCMImage":                 "registry.k8s.io/cloud-provider-gcp/cloud-controller-manager:v35.0.0",
+		"FeatureGates":             cfg.Spec.FeatureGates,
+		"RuntimeConfig":            rcBuilder.String(),
+		"BootstrapToken":           bootstrapToken,
+		"DiscoveryTokenCaCertHash": "sha256:0000000000000000000000000000000000000000000000000000000000000000", // dummy hash for CP VM init
+	}
 
-		res, err := m.EnsureExternalAPIServer(ctx, cfg, zone, netName, subName)
-		if err != nil {
-			return fmt.Errorf("failed to ensure external apiserver: %v", err)
-		}
-		// Parse the endpoint IP into a URL
-		u, err := url.Parse(fmt.Sprintf("https://%s", net.JoinHostPort(res.Endpoint, "6443")))
-		if err != nil {
-			return fmt.Errorf("failed to parse external apiserver url: %v", err)
-		}
-		cfg.Spec.ExternalAPIServer = u
-
-		// Use generated kubeconfigs
-		adminKubeconfig = res.AdminKubeconfig
-		schedulerKubeconfig = res.SchedulerKubeconfig
-		cmKubeconfig = res.ControllerManagerKubeconfig
-
-		// Write Admin Kubeconfig locally for kubectl usage
-		localKubeconfig = filepath.Join(tmpDir, "admin.conf")
-		if err := os.WriteFile(localKubeconfig, []byte(adminKubeconfig), 0600); err != nil {
-			return fmt.Errorf("failed to write kubeconfig to %s: %v", localKubeconfig, err)
-		}
-		klog.Infof("    ✅ Admin Kubeconfig generated locally at %s", localKubeconfig)
-
-		// Store PKI data for Control Plane provisioning
-		caCert = res.CACert
-		saPub = res.SAPub
-		// Signing CA for KCM
-		// We'll write these to the CP node
-		saKey = res.SAKey
-		signingKey = res.SigningKey
-		signingCert = res.SigningCert
-		frontProxyCACert = res.FrontProxyCACert
-		return nil
-	}(); err != nil {
+	// Render base install script (startup.sh)
+	baseInstallScript, err := m.renderTemplate("templates/startup.sh", templateData)
+	if err != nil {
 		return err
 	}
 
-	// 2. Load Balancer / Endpoint
-	klog.Infof("  > Using External APIServer at %s", cfg.Spec.ExternalAPIServer.String())
-	// 6. Wait for Control Plane Ready
+	// Render kubeadm config
+	kubeadmConfigDummy, err := m.renderTemplate("templates/kubeadm-config.yaml", templateData)
+	if err != nil {
+		return err
+	}
+	if len(cfg.Spec.KubeadmConfigPatches) > 0 {
+		for _, patch := range cfg.Spec.KubeadmConfigPatches {
+			kubeadmConfigDummy = kubeadmConfigDummy + "\n---\n" + patch
+		}
+	}
+
+	cpStartupScript := fmt.Sprintf(`%s
+
+# ---------------------------------------------------------
+# Control Plane Bootstrap
+# ---------------------------------------------------------
+echo "👑 kingc: Writing kubeadm config..."
+mkdir -p /etc/kubernetes
+cat <<EOF > /etc/kubernetes/kubeadm-config.yaml
+%s
+EOF
+
+echo "👑 kingc: Running Kubeadm Init..."
+kubeadm init --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-errors=NumCPU
+
+echo "👑 kingc: Control Plane Bootstrapped"
+`, baseInstallScript, kubeadmConfigDummy)
+
+	tmpCPStartup := filepath.Join(tmpDir, "cp-startup.sh")
+	if err := os.WriteFile(tmpCPStartup, []byte(cpStartupScript), 0644); err != nil {
+		return fmt.Errorf("failed to write startup script: %v", err)
+	}
+
+	// 4. Provision Control Plane
+	{
+		defer m.measure("Control Plane Provisioning")()
+		klog.Infof("  > Provisioning Control Plane VM (%s) with IP %s...", cpZone, cpIP)
+		err = m.gce.CreateInstance(
+			ctx,
+			cpName, cpZone, cfg.Spec.ControlPlane.MachineType,
+			cpNet, cpSub,
+			config.DefaultImageFamily, "", tmpCPStartup,
+			cpIP, "",
+			[]string{
+				basename(cfg.Metadata.Name),
+				"kingc-role-control-plane",
+			},
+		)
+		if err != nil {
+			klog.Warningf("    (Instance warning: %v)", err)
+		}
+	}
+
+	// 5. Wait for API Server to be ready
 	if err := func() error {
 		defer m.measure("Wait for API Server")()
 		klog.Infof("  > Waiting for Kubernetes API Server (%s) to be ready...", cfg.Spec.ExternalAPIServer.String())
@@ -225,182 +286,28 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 		return err
 	}
 
-	// 3. Prepare Base Scripts (Pass Version info)
-
-	// Format RuntimeConfig map to string "key=value,key2=value2" for CLI flag
-	var rcBuilder strings.Builder
-	firstRC := true
-	for k, v := range cfg.Spec.RuntimeConfig {
-		if !firstRC {
-			rcBuilder.WriteString(",")
-		}
-		rcBuilder.WriteString(fmt.Sprintf("%s=%s", k, v))
-		firstRC = false
-	}
-
-	// Calculate Repo Version (Major.Minor) from KubernetesVersion (Major.Minor.Patch)
-	// e.g. v1.30.0 -> v1.30
-	repoVer := cfg.Spec.Kubernetes.Version
-	parts := strings.Split(repoVer, ".")
-	if len(parts) >= 2 {
-		repoVer = strings.Join(parts[:2], ".")
-	}
-
-	templateData := map[string]interface{}{
-		"ClusterName":                 cfg.Metadata.Name,
-		"ControlPlaneEndpoint":        cfg.Spec.ExternalAPIServer.Host,
-		"ControlPlaneIP":              cfg.Spec.ExternalAPIServer.Hostname(),
-		"KubernetesVersion":           cfg.Spec.Kubernetes.Version,
-		"KubernetesRepoVersion":       repoVer,
-		"PodSubnet":                   cfg.Spec.Kubernetes.Networking.PodCIDR,
-		"ServiceSubnet":               cfg.Spec.Kubernetes.Networking.ServiceCIDR,
-		"KindnetImage":                "registry.k8s.io/networking/kindnet:v1.0.0",
-		"CCMImage":                    "registry.k8s.io/cloud-provider-gcp/cloud-controller-manager:v35.0.0",
-		"FeatureGates":                cfg.Spec.FeatureGates,
-		"RuntimeConfig":               rcBuilder.String(),
-		"Kubeconfig":                  adminKubeconfig,
-		"SchedulerKubeconfig":         schedulerKubeconfig,
-		"ControllerManagerKubeconfig": cmKubeconfig,
-	}
-
-	// Render the base installation script
-	baseInstallScript, err := m.renderTemplate("templates/startup.sh", templateData)
-	if err != nil {
-		return err
-	}
-
-	// 3.5 Create Bootstrap Token (Early)
-	var bootstrapToken, caHash string
+	// 6. Retrieve Kubeconfig and CA certificate from Control Plane VM
+	var adminKubeconfig string
+	var caCert []byte
 	{
-		klog.Infof("  > Creating Bootstrap Token...")
-		bootstrapToken, caHash, err = m.createBootstrapToken(caCert)
+		klog.Infof("  > Retrieving admin kubeconfig and CA cert from Control Plane VM...")
+		adminKubeconfig, err = m.gce.RunSSHOutput(ctx, cpName, cpZone, "sudo cat /etc/kubernetes/admin.conf")
 		if err != nil {
-			return fmt.Errorf("create bootstrap token: %v", err)
+			return fmt.Errorf("failed to retrieve admin kubeconfig: %v", err)
 		}
-		// Add to template data
-		templateData["BootstrapToken"] = bootstrapToken
-		templateData["DiscoveryTokenCaCertHash"] = caHash
-
-		// Create Bootstrap Resources via API
-		if err := CreateBootstrapResources(ctx, localKubeconfig, bootstrapToken, caCert, cfg.Spec.ExternalAPIServer.String()); err != nil {
-			return fmt.Errorf("failed to create bootstrap resources: %v", err)
-		}
-		klog.Infof("    ✅ Bootstrap Token Secret and cluster-info created via API")
-	}
-
-	bootstrapKubeconfig, err := CreateBootstrapKubeconfig(cfg.Metadata.Name, cfg.Spec.ExternalAPIServer.String(), caCert, bootstrapToken)
-	if err != nil {
-		return fmt.Errorf("create bootstrap kubeconfig: %v", err)
-	}
-
-	// 4. Prepare Control Plane Config & Script
-	klog.Infof("  > Generating Kubeadm Join config for Control Plane...")
-	// We use JoinConfiguration now
-	kubeadmConfig, err := m.renderTemplate("templates/kubeadm-config.yaml", templateData)
-	if err != nil {
-		return err
-	}
-
-	if len(cfg.Spec.KubeadmConfigPatches) > 0 {
-		for _, patch := range cfg.Spec.KubeadmConfigPatches {
-			kubeadmConfig = kubeadmConfig + "\n---\n" + patch
-		}
-	}
-
-	cpStartupScript := fmt.Sprintf(`%s
-
-# ---------------------------------------------------------
-# Control Plane Bootstrap
-# ---------------------------------------------------------
-echo "👑 kingc: Writing PKI files (SA Keys & Signing CA)..."
-mkdir -p /etc/kubernetes/pki
-# We must provide ca.crt for kubeadm init to use our external CA.
-echo "%s" > /etc/kubernetes/pki/ca.crt
-# TODO(aojea): This is needed to avoid to fail kubeadm init validation
-# for external CA names
-touch /etc/kubernetes/pki/ca.key
-
-# Service Account Keys/Pub
-echo "%s" > /etc/kubernetes/pki/sa.pub
-echo "%s" > /etc/kubernetes/pki/sa.key
-
-# Signing CA for KCM (CSR Signing)
-echo "%s" > /etc/kubernetes/pki/node-ca.crt
-echo "%s" > /etc/kubernetes/pki/node-ca.key
-
-# Front-proxy CA
-echo "%s" > /etc/kubernetes/pki/front-proxy-ca.crt
-touch /etc/kubernetes/pki/front-proxy-ca.key
-
-echo "👑 kingc: Writing Kubeconfigs..."
-echo "%s" > /etc/kubernetes/admin.conf
-echo "%s" > /etc/kubernetes/scheduler.conf
-echo "%s" > /etc/kubernetes/controller-manager.conf
-echo "%s" > /etc/kubernetes/bootstrap-kubelet.conf
-
-echo "👑 kingc: Writing kubeadm config..."
-mkdir -p /etc/kubernetes
-cat <<EOF > /etc/kubernetes/kubeadm-config.yaml
-%s
-EOF
-
-echo "👑 kingc: Running Kubeadm Init Phases..."
-# Write controller-manager and scheduler manifests
-kubeadm init phase control-plane controller-manager --config /etc/kubernetes/kubeadm-config.yaml
-kubeadm init phase control-plane scheduler --config /etc/kubernetes/kubeadm-config.yaml
-
-kubeadm init phase upload-config all --config /etc/kubernetes/kubeadm-config.yaml
-
-kubeadm init phase kubelet-start --config /etc/kubernetes/kubeadm-config.yaml
-
-kubeadm init phase addon all --config /etc/kubernetes/kubeadm-config.yaml
-kubeadm init phase kubelet-finalize all --config /etc/kubernetes/kubeadm-config.yaml
-kubeadm init phase mark-control-plane --config /etc/kubernetes/kubeadm-config.yaml
-
-echo "👑 kingc: Control Plane Bootstrapped"
-`, baseInstallScript, string(caCert), string(saPub), string(saKey), string(signingCert), string(signingKey), string(frontProxyCACert),
-		templateData["Kubeconfig"], templateData["SchedulerKubeconfig"], templateData["ControllerManagerKubeconfig"],
-		string(bootstrapKubeconfig), kubeadmConfig)
-
-	tmpCPStartup := filepath.Join(tmpDir, "cp-startup.sh")
-	if err := os.WriteFile(tmpCPStartup, []byte(cpStartupScript), 0644); err != nil {
-		return fmt.Errorf("failed to write startup script: %v", err)
-	}
-
-	// 5. Provision Control Plane
-	var cpName, cpZone, cpNet, cpSub string
-	{
-		defer m.measure("Control Plane Provisioning")()
-		if len(cfg.Spec.Networks) == 0 {
-			return fmt.Errorf("no networks defined in spec")
-		}
-
-		cpNet = cfg.Spec.Networks[0].Name
-		cpSub, err = resolveSubnet(cfg.Spec.Networks, cpNet, "")
+		caCertStr, err := m.gce.RunSSHOutput(ctx, cpName, cpZone, "sudo cat /etc/kubernetes/pki/ca.crt")
 		if err != nil {
-			return fmt.Errorf("resolving CP network: %v", err)
+			return fmt.Errorf("failed to retrieve CA certificate: %v", err)
 		}
+		caCert = []byte(caCertStr)
 
-		cpZone = cfg.Spec.ControlPlane.Zone
-		cpName = fmt.Sprintf("%s-cp", cfg.Metadata.Name)
-
-		klog.Infof("  > Provisioning Control Plane VM (%s)...", cpZone)
-		err = m.gce.CreateInstance(
-			ctx,
-			cpName, cpZone, cfg.Spec.ControlPlane.MachineType,
-			cpNet, cpSub,
-			config.DefaultImageFamily, "", tmpCPStartup,
-			"",
-			[]string{
-				basename(cfg.Metadata.Name),
-				"kingc-role-control-plane",
-			},
-		)
-		if err != nil {
-			klog.Warningf("    (Instance warning: %v)", err)
+		localKubeconfig = filepath.Join(tmpDir, "admin.conf")
+		if err := os.WriteFile(localKubeconfig, []byte(adminKubeconfig), 0600); err != nil {
+			return fmt.Errorf("failed to write kubeconfig to %s: %v", localKubeconfig, err)
 		}
-
+		klog.Infof("    ✅ Admin Kubeconfig generated locally at %s", localKubeconfig)
 	}
+
 	// Install Cloud Controller Manager
 	{
 		defer m.measure("Install CCM")()
@@ -422,7 +329,24 @@ echo "👑 kingc: Control Plane Bootstrapped"
 		if out, err := cmd.CombinedOutput(); err != nil {
 			klog.Warningf("    ⚠️  Failed to install CCM: %v\nOutput: %s", err, out)
 		}
+	}
 
+	// 7. Calculate actual CA hash
+	caHash, err := calculateCACertHash(caCert)
+	if err != nil {
+		return fmt.Errorf("failed to calculate CA cert hash: %v", err)
+	}
+	templateData["DiscoveryTokenCaCertHash"] = caHash
+
+	// 8. Prepare worker startup configuration with correct CA hash
+	kubeadmConfigReal, err := m.renderTemplate("templates/kubeadm-config.yaml", templateData)
+	if err != nil {
+		return err
+	}
+	if len(cfg.Spec.KubeadmConfigPatches) > 0 {
+		for _, patch := range cfg.Spec.KubeadmConfigPatches {
+			kubeadmConfigReal = kubeadmConfigReal + "\n---\n" + patch
+		}
 	}
 
 	// 9. Worker Pools
@@ -442,7 +366,7 @@ cat <<EOF > /etc/kubernetes/kubeadm-config.yaml
 EOF
 echo "👑 kingc: Joining cluster..."
 kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-errors=NumCPU
-`, baseInstallScript, kubeadmConfig)
+`, baseInstallScript, kubeadmConfigReal)
 
 		tmpWorkerStartup := filepath.Join(tmpDir, "worker-startup.sh")
 		if err := os.WriteFile(tmpWorkerStartup, []byte(workerStartup), 0644); err != nil {
@@ -651,6 +575,29 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 	}(); err != nil {
 	}
 
+	// Delete IP Addresses
+	if err := func() error {
+		defer m.measure("IP Addresses Cleanup")()
+		klog.Infof("  > Cleaning up IP Addresses...")
+		filter := fmt.Sprintf("name:kingc-cluster-%s*", name)
+		addrs, err := m.gce.ListAddresses(ctx, filter)
+		if err != nil {
+			klog.Warningf("    ⚠️  Failed to list addresses: %v", err)
+		} else {
+			for _, addr := range addrs {
+				klog.Infof("  > Deleting IP Address %s in %s...", addr.Name, addr.Region)
+				if err := m.gce.DeleteAddress(ctx, addr.Name, addr.Region); err != nil && !gce.IsNotFoundError(err) {
+					klog.Warningf("    ⚠️  Failed: %v", err)
+					errs = append(errs, fmt.Errorf("delete address %s: %w", addr.Name, err))
+				} else {
+					klog.Infof("    ✅ Done")
+				}
+			}
+		}
+		return nil
+	}(); err != nil {
+	}
+
 	if len(errs) > 0 {
 		return fmt.Errorf("cleanup failed with %d errors: %v", len(errs), errs)
 	}
@@ -756,4 +703,48 @@ func (m *Manager) ExportLogs(ctx context.Context, clusterName, outDir string) er
 		return fmt.Errorf("encountered %d errors collecting logs", len(errs))
 	}
 	return nil
+}
+
+func (m *Manager) waitForAPIServer(ctx context.Context, uri *url.URL, timeout time.Duration) error {
+	// uri already contains scheme (https), so just append path.
+	// We handle the url package shadowing by using a different variable name.
+	target := *uri
+	target.Path = "/healthz"
+	healthURL := target.String()
+
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
+
+	start := time.Now()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if time.Since(start) > timeout {
+			return fmt.Errorf("timed out waiting for API server at %s", healthURL)
+		}
+
+		// Create request with context to respect cancellation during request
+		req, err := http.NewRequestWithContext(ctx, "GET", healthURL, nil)
+		if err == nil {
+			resp, err := client.Do(req)
+			if err == nil {
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					return nil
+				}
+			}
+		}
+		fmt.Print(".")
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
 }

@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"time"
 
 	"github.com/aojea/kingc/pkg/config"
 	"k8s.io/klog/v2"
@@ -267,7 +266,7 @@ func (c *Client) DeleteStaticIP(ctx context.Context, name, region string) error 
 	return nil
 }
 
-func (c *Client) CreateInstance(ctx context.Context, name, zone, machineType, network, subnet, image, serviceAccount, startupScript, address string, tags []string) error {
+func (c *Client) CreateInstance(ctx context.Context, name, zone, machineType, network, subnet, image, serviceAccount, startupScript, address, privateIP string, tags []string) error {
 	args := []string{
 		"compute", "instances", "create", name,
 		"--zone", zone,
@@ -284,6 +283,9 @@ func (c *Client) CreateInstance(ctx context.Context, name, zone, machineType, ne
 	if address != "" {
 		args = append(args, "--address", address)
 	}
+	if privateIP != "" {
+		args = append(args, "--private-network-ip", privateIP)
+	}
 	if serviceAccount != "" {
 		args = append(args, "--service-account", serviceAccount)
 	}
@@ -293,252 +295,6 @@ func (c *Client) CreateInstance(ctx context.Context, name, zone, machineType, ne
 
 func (c *Client) DeleteInstance(ctx context.Context, name, zone string) error {
 	_, err := c.Run(ctx, "compute", "instances", "delete", name, "--zone", zone, "--quiet")
-	return err
-}
-
-// --- CAS (Private CA) Lifecycle ---
-
-func (c *Client) CreateCASPool(ctx context.Context, poolID, region string) error {
-	if _, err := c.RunQuiet(ctx, "privateca", "pools", "describe", poolID, "--location", region); err == nil {
-		return nil
-	}
-	args := []string{
-		"privateca", "pools", "create", poolID,
-		"--location", region,
-		"--tier", "DEVOPS",
-		"--quiet",
-	}
-	_, err := c.Run(ctx, args...)
-	return err
-}
-
-func (c *Client) CreateCASRootCA(ctx context.Context, poolID, region, caID, commonName string) error {
-	if _, err := c.RunQuiet(ctx, "privateca", "roots", "describe", caID, "--pool", poolID, "--location", region); err == nil {
-		return nil
-	}
-	args := []string{
-		"privateca", "roots", "create", caID,
-		"--pool", poolID,
-		"--location", region,
-		"--subject", fmt.Sprintf("CN=%s,O=kingc", commonName),
-		"--key-algorithm", "rsa-pkcs1-2048-sha256",
-		"--max-chain-length", "2",
-		"--validity", "P10Y",
-		"--quiet",
-	}
-	_, err := c.Run(ctx, args...)
-	return err
-}
-
-func (c *Client) DeleteCASPool(ctx context.Context, poolID, region string) error {
-	args := []string{
-		"privateca", "pools", "delete", poolID,
-		"--location", region,
-		"--ignore-dependent-resources",
-		"--quiet",
-	}
-	_, err := c.Run(ctx, args...)
-	return err
-}
-
-// SignCASCertificate signs a CSR using Google Cloud CAS with specified validity.
-// The CSR must contain all necessary extensions (BasicConstraints, KeyUsage, etc.).
-func (c *Client) SignCASCertificate(ctx context.Context, csrPEM []byte, pool, location, caName string, validity string) ([]byte, error) {
-	tmpCsr, err := os.CreateTemp("", "kingc-csr-*.pem")
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = os.Remove(tmpCsr.Name()) }()
-	if _, err := tmpCsr.Write(csrPEM); err != nil {
-		return nil, err
-	}
-	_ = tmpCsr.Close()
-
-	tmpCert, err := os.CreateTemp("", "kingc-cert-*.pem")
-	if err != nil {
-		return nil, err
-	}
-	_ = tmpCert.Close()
-	defer func() { _ = os.Remove(tmpCert.Name()) }()
-
-	// certID must be unique. Let's use a random suffix or timestamp.
-	certID := fmt.Sprintf("kingc-cert-%d", time.Now().UnixNano())
-	args := []string{
-		"privateca", "certificates", "create", certID,
-		"--csr", tmpCsr.Name(),
-		"--cert-output-file", tmpCert.Name(),
-		"--issuer-pool", pool,
-		"--issuer-location", location,
-		"--validity", validity,
-		"--quiet",
-	}
-	if caName != "" {
-		args = append(args, "--ca", caName)
-	}
-
-	if _, err := c.Run(ctx, args...); err != nil {
-		return nil, fmt.Errorf("gcloud privateca failed: %v", err)
-	}
-
-	return os.ReadFile(tmpCert.Name())
-}
-
-func (c *Client) GetCASRootCertificate(ctx context.Context, poolID, region, caID string) ([]byte, error) {
-	// privateca roots describe ... --format="value(pemCaCertificates)"
-	args := []string{
-		"privateca", "roots", "describe", caID,
-		"--pool", poolID,
-		"--location", region,
-		"--format", "value(pemCaCertificates)",
-	}
-	out, err := c.RunQuiet(ctx, args...)
-	if err != nil {
-		return nil, err
-	}
-	return []byte(strings.TrimSpace(out)), nil
-}
-
-func (c *Client) CreateContainerInstance(
-	ctx context.Context,
-	name, zone, machineType, network, subnet,
-	containerImage string,
-	containerMounts []string, // e.g. "host-path=/tmp,mount-path=/tmp,mode=rw"
-	containerEnv map[string]string,
-	containerArgs []string,
-	address string,
-	tags []string,
-	metadata map[string]string, // e.g. startup-script
-) error {
-	args := []string{
-		"compute", "instances", "create-with-container", name,
-		"--zone", zone,
-		"--machine-type", machineType,
-		"--network", network,
-		"--subnet", subnet,
-		"--container-image", containerImage,
-		"--image-project", "cos-cloud",
-		"--image-family", "cos-stable", // Use COS for container instances
-		"--boot-disk-size", "50GB",
-		"--scopes", "cloud-platform",
-		"--tags", strings.Join(tags, ","),
-	}
-
-	if address != "" {
-		args = append(args, "--address", address)
-	}
-
-	for _, m := range containerMounts {
-		args = append(args, "--container-mount-host-path", m)
-	}
-
-	for k, v := range containerEnv {
-		args = append(args, "--container-env", fmt.Sprintf("%s=%s", k, v))
-	}
-
-	for _, arg := range containerArgs {
-		args = append(args, fmt.Sprintf("--container-arg=%s", arg))
-	}
-
-	var metadataList []string
-	var metadataFromFileList []string
-
-	for k, v := range metadata {
-		// If the value is a multiline script (like startup-script), we MUST use --metadata-from-file
-		// to avoid quoting issues with gcloud dict parsing.
-		// For simplicity, let's write it to a temp file if it looks like a script/content
-		// OR just assume 'startup-script' always goes to file.
-		if k == "startup-script" {
-			tmpScript, err := os.CreateTemp("", "kingc-startup-*.sh")
-			if err != nil {
-				return fmt.Errorf("failed to create temp startup script: %v", err)
-			}
-			// We won't defer remove here because gcloud command needs it.
-			// But we should cleanup after Run.
-			defer func() {
-				_ = os.Remove(tmpScript.Name())
-			}()
-
-			if _, err := tmpScript.WriteString(v); err != nil {
-				return err
-			}
-			_ = tmpScript.Close()
-			metadataFromFileList = append(metadataFromFileList, fmt.Sprintf("%s=%s", k, tmpScript.Name()))
-		} else {
-			// Normal metadata
-			metadataList = append(metadataList, fmt.Sprintf("%s=%s", k, v))
-		}
-	}
-
-	if len(metadataList) > 0 {
-		args = append(args, "--metadata", strings.Join(metadataList, ","))
-	}
-	if len(metadataFromFileList) > 0 {
-		args = append(args, "--metadata-from-file", strings.Join(metadataFromFileList, ","))
-	}
-
-	// We might need --metadata-from-file if the value is a file path
-	// But let's assume the caller handles writing files if needed or passes metadata directly.
-	// Actually, gcloud `create-with-container` supports `--metadata-from-file`.
-	// Let's add specific support if needed, or just let metadata map handle key=value.
-	// NOTE: gcloud --metadata flag takes key=value.
-	// If the user wants to pass a script content, they usually use --metadata-from-file startup-script=PATH.
-	// Let's overload `metadata` to allow FILE references if they start with FILE:?
-	// Or just add a specific argument for startup script file?
-	// Let's add `metadataFromFile` map.
-
-	_, err := c.Run(ctx, args...)
-	return err
-}
-
-func (c *Client) CreateContainerInstanceWithMetadataFiles(
-	ctx context.Context,
-	name, zone, machineType, network, subnet,
-	containerImage string,
-	containerMounts []string,
-	containerEnv map[string]string,
-	tags []string,
-	metadata map[string]string,
-	metadataFiles map[string]string,
-) error {
-	args := []string{
-		"compute", "instances", "create-with-container", name,
-		"--zone", zone,
-		"--machine-type", machineType,
-		"--network", network,
-		"--subnet", subnet,
-		"--container-image", containerImage,
-		"--image-project", "cos-cloud",
-		"--image-family", "cos-stable",
-		"--boot-disk-size", "50GB",
-		"--scopes", "cloud-platform",
-		"--tags", strings.Join(tags, ","),
-	}
-
-	for _, m := range containerMounts {
-		args = append(args, "--container-mount-host-path", m)
-	}
-
-	for k, v := range containerEnv {
-		args = append(args, "--container-env", fmt.Sprintf("%s=%s", k, v))
-	}
-
-	if len(metadata) > 0 {
-		var metaList []string
-		for k, v := range metadata {
-			metaList = append(metaList, fmt.Sprintf("%s=%s", k, v))
-		}
-		args = append(args, "--metadata", strings.Join(metaList, ","))
-	}
-
-	if len(metadataFiles) > 0 {
-		var metaFilesList []string
-		for k, v := range metadataFiles {
-			metaFilesList = append(metaFilesList, fmt.Sprintf("%s=%s", k, v))
-		}
-		args = append(args, "--metadata-from-file", strings.Join(metaFilesList, ","))
-	}
-
-	_, err := c.Run(ctx, args...)
 	return err
 }
 
@@ -735,81 +491,6 @@ func (c *Client) AddInstancesToGroup(ctx context.Context, group, zone string, in
 	return err
 }
 
-func (c *Client) CreateRegionHealthCheck(ctx context.Context, name, region string) error {
-	_, err := c.Run(ctx, "compute", "health-checks", "create", "tcp", name, "--region", region, "--port", "6443")
-	return err
-}
-
-func (c *Client) CreateRegionBackendService(ctx context.Context, name, region, healthCheck string) error {
-	_, err := c.Run(ctx, "compute", "backend-services", "create", name, "--protocol", "TCP", "--health-checks", healthCheck, "--health-checks-region", region, "--region", region, "--load-balancing-scheme", "EXTERNAL")
-	return err
-}
-
-type BackendService struct {
-	Name   string `json:"name"`
-	Region string `json:"region"`
-}
-
-func (c *Client) ListBackendServices(ctx context.Context, filter string) ([]BackendService, error) {
-	var services []BackendService
-	err := c.RunJSON(ctx, &services, "compute", "backend-services", "list", "--filter", filter)
-	if err != nil {
-		return nil, err
-	}
-	for i := range services {
-		if services[i].Region != "" {
-			parts := strings.Split(services[i].Region, "/")
-			services[i].Region = parts[len(parts)-1]
-		}
-	}
-	return services, nil
-}
-
-func (c *Client) AddRegionBackend(ctx context.Context, service, region, group, groupZone string) error {
-	_, err := c.Run(ctx, "compute", "backend-services", "add-backend", service, "--region", region, "--instance-group", group, "--instance-group-zone", groupZone)
-	return err
-}
-
-func (c *Client) CreateRegionForwardingRule(ctx context.Context, name, region, service, address string) error {
-	_, err := c.Run(ctx, "compute", "forwarding-rules", "create", name, "--region", region, "--backend-service", service, "--address", address, "--ports", "6443")
-	return err
-}
-
-type ForwardingRule struct {
-	Name   string `json:"name"`
-	Region string `json:"region"`
-}
-
-func (c *Client) ListForwardingRules(ctx context.Context, filter string) ([]ForwardingRule, error) {
-	var rules []ForwardingRule
-	err := c.RunJSON(ctx, &rules, "compute", "forwarding-rules", "list", "--filter", filter)
-	if err != nil {
-		return nil, err
-	}
-	for i := range rules {
-		if rules[i].Region != "" {
-			parts := strings.Split(rules[i].Region, "/")
-			rules[i].Region = parts[len(parts)-1]
-		}
-	}
-	return rules, nil
-}
-
-func (c *Client) DeleteRegionForwardingRule(ctx context.Context, name, region string) error {
-	_, err := c.Run(ctx, "compute", "forwarding-rules", "delete", name, "--region", region, "--quiet")
-	return err
-}
-
-func (c *Client) DeleteRegionBackendService(ctx context.Context, name, region string) error {
-	_, err := c.Run(ctx, "compute", "backend-services", "delete", name, "--region", region, "--quiet")
-	return err
-}
-
-func (c *Client) DeleteRegionHealthCheck(ctx context.Context, name, region string) error {
-	_, err := c.Run(ctx, "compute", "health-checks", "delete", name, "--region", region, "--quiet")
-	return err
-}
-
 func (c *Client) DeleteUnmanagedInstanceGroup(ctx context.Context, name, zone string) error {
 	_, err := c.Run(ctx, "compute", "instance-groups", "unmanaged", "delete", name, "--zone", zone, "--quiet")
 	return err
@@ -846,4 +527,12 @@ func (c *Client) ListInstances(ctx context.Context, tags []string) ([]Instance, 
 		instances[i].Zone = parts[len(parts)-1]
 	}
 	return instances, nil
+}
+
+func (c *Client) GetInternalIP(ctx context.Context, name, zone string) (string, error) {
+	out, err := c.RunQuiet(ctx, "compute", "instances", "describe", name, "--zone", zone, "--format=value(networkInterfaces[0].networkIP)")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
 }

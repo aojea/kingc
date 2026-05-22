@@ -182,6 +182,42 @@ func TestValidate(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "Invalid config (ControlPlane.Replicas > 1)",
+			input: &Cluster{
+				Version: CurrentVersion,
+				Spec: Spec{
+					Region: "us-central1",
+					Networks: []NetworkSpec{{
+						Name: "default",
+						Subnets: []SubnetSpec{
+							{Name: "sub-central", Region: "us-central1", CIDR: "10.0.0.0/24"},
+						},
+					}},
+					ControlPlane: NodeGroup{Region: "us-central1", Replicas: 3},
+					WorkerGroups: []NodeGroup{{Region: "us-central1"}},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "Valid config (ControlPlane.Replicas = 1)",
+			input: &Cluster{
+				Version: CurrentVersion,
+				Spec: Spec{
+					Region: "us-central1",
+					Networks: []NetworkSpec{{
+						Name: "default",
+						Subnets: []SubnetSpec{
+							{Name: "sub-central", Region: "us-central1", CIDR: "10.0.0.0/24"},
+						},
+					}},
+					ControlPlane: NodeGroup{Region: "us-central1", Replicas: 1},
+					WorkerGroups: []NodeGroup{{Region: "us-central1"}},
+				},
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tt := range tests {

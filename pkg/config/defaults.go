@@ -103,4 +103,7 @@ func (c *Cluster) applyNodeGroupDefaults(ng *NodeGroup) {
 		// Let's assume Zonal default if nothing specified for MVP/Simplicity, matching previous behavior.
 		ng.Zone = defaultZone
 	}
+	if ng.Replicas == 0 {
+		ng.Replicas = 1
+	}
 }

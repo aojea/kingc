@@ -89,6 +89,12 @@ It attempts to mimic the behavior and user experience of 'kind' but for GCE.`,
 			fmt.Println("kingc " + version)
 		},
 	}
+
+	preflightCmd = &cobra.Command{
+		Use:   "preflight",
+		Short: "Run preflight checks to validate environment and GCP requirements",
+		Run:   runPreflight,
+	}
 )
 
 func init() {
@@ -134,6 +140,7 @@ func init() {
 	exportCmd.AddCommand(exportLogsCmd)
 
 	rootCmd.AddCommand(versionCmd)
+	rootCmd.AddCommand(preflightCmd)
 	rootCmd.AddCommand(completionCmd)
 
 	// Create Cluster Flags
@@ -297,18 +304,34 @@ func runCreateCluster(cmd *cobra.Command, args []string) {
 	}
 }
 
+func runPreflight(cmd *cobra.Command, args []string) {
+	client := getClient(cmd)
+	if err := cluster.NewManager(client).Preflight(cmd.Context()); err != nil {
+		klog.Fatalf("❌ Preflight checks failed: %v", err)
+	}
+	fmt.Println("✅ Preflight checks passed.")
+}
+
 func runDeleteCluster(cmd *cobra.Command, args []string) {
 	name, _ := cmd.Flags().GetString("name")
 	client := getClient(cmd)
+	mgr := cluster.NewManager(client)
+	if err := mgr.Preflight(cmd.Context()); err != nil {
+		klog.Fatalf("❌ Preflight checks failed: %v", err)
+	}
 
-	if err := cluster.NewManager(client).Delete(cmd.Context(), name); err != nil {
+	if err := mgr.Delete(cmd.Context(), name); err != nil {
 		klog.Fatalf("❌ Error deleting cluster: %v", err)
 	}
 }
 
 func runGetClusters(cmd *cobra.Command, args []string) {
 	client := getClient(cmd)
-	clusters, err := cluster.NewManager(client).ListClusters(cmd.Context())
+	mgr := cluster.NewManager(client)
+	if err := mgr.Preflight(cmd.Context()); err != nil {
+		klog.Fatalf("❌ Preflight checks failed: %v", err)
+	}
+	clusters, err := mgr.ListClusters(cmd.Context())
 	if err != nil {
 		klog.Fatalf("❌ Error listing clusters: %v", err)
 	}
@@ -320,7 +343,11 @@ func runGetClusters(cmd *cobra.Command, args []string) {
 func runGetNodes(cmd *cobra.Command, args []string) {
 	name, _ := cmd.Flags().GetString("name")
 	client := getClient(cmd)
-	nodes, err := cluster.NewManager(client).ListNodes(cmd.Context(), name)
+	mgr := cluster.NewManager(client)
+	if err := mgr.Preflight(cmd.Context()); err != nil {
+		klog.Fatalf("❌ Preflight checks failed: %v", err)
+	}
+	nodes, err := mgr.ListNodes(cmd.Context(), name)
 	if err != nil {
 		klog.Fatalf("❌ Error listing nodes for cluster %s: %v", name, err)
 	}
@@ -338,7 +365,11 @@ func runGetNodes(cmd *cobra.Command, args []string) {
 func runGetKubeconfig(cmd *cobra.Command, args []string) {
 	name, _ := cmd.Flags().GetString("name")
 	client := getClient(cmd)
-	kc, err := cluster.NewManager(client).GetKubeconfig(cmd.Context(), name)
+	mgr := cluster.NewManager(client)
+	if err := mgr.Preflight(cmd.Context()); err != nil {
+		klog.Fatalf("❌ Preflight checks failed: %v", err)
+	}
+	kc, err := mgr.GetKubeconfig(cmd.Context(), name)
 	if err != nil {
 		klog.Fatalf("❌ Error retrieving kubeconfig: %v", err)
 	}
@@ -361,7 +392,11 @@ func runExportLogs(cmd *cobra.Command, args []string) {
 	}
 
 	client := getClient(cmd)
-	if err := cluster.NewManager(client).ExportLogs(cmd.Context(), name, outDir); err != nil {
+	mgr := cluster.NewManager(client)
+	if err := mgr.Preflight(cmd.Context()); err != nil {
+		klog.Fatalf("❌ Preflight checks failed: %v", err)
+	}
+	if err := mgr.ExportLogs(cmd.Context(), name, outDir); err != nil {
 		klog.Fatalf("❌ Error exporting logs: %v", err)
 	}
 	fmt.Printf("✅ Logs exported to %s\n", outDir)

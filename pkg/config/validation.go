@@ -14,6 +14,10 @@ func (c *Cluster) Validate() error {
 		return fmt.Errorf("spec.region is required")
 	}
 
+	if c.Spec.ControlPlane.Replicas > 1 {
+		return fmt.Errorf("controlPlane.replicas must be 1 (multi-master is not supported)")
+	}
+
 	if err := c.validateNodeGroup("control-plane", c.Spec.ControlPlane); err != nil {
 		return err
 	}
