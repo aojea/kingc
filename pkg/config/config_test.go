@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -317,4 +318,40 @@ func TestResolveImage(t *testing.T) {
 		})
 	}
 }
+
+func TestMapTPURuntimeVersion(t *testing.T) {
+	tests := []struct {
+		tpuType         string
+		expectedRuntime string
+	}{
+		{tpuType: "v6e-4", expectedRuntime: "v2-alpha-tpuv6e"},
+		{tpuType: "v5p-8", expectedRuntime: "v2-alpha-tpuv5"},
+		{tpuType: "v5litepod-8", expectedRuntime: "v2-alpha-tpuv5-lite"},
+		{tpuType: "v4-8", expectedRuntime: "tpu-ubuntu2204-base"},
+	}
+
+	for _, tt := range tests {
+		got := MapTPURuntimeVersion(tt.tpuType)
+		if got != tt.expectedRuntime {
+			t.Errorf("MapTPURuntimeVersion(%q) = %q, expected %q", tt.tpuType, got, tt.expectedRuntime)
+		}
+	}
+}
+
+func TestDeriveSubnetCIDR(t *testing.T) {
+	c1 := deriveSubnetCIDR("us-central1")
+	c2 := deriveSubnetCIDR("us-east5")
+	c3 := deriveSubnetCIDR("europe-west4")
+
+	if c1 == c2 || c1 == c3 || c2 == c3 {
+		t.Errorf("expected unique derived CIDRs, got: central=%s, east=%s, europe=%s", c1, c2, c3)
+	}
+	
+	// Check pattern format
+	if !strings.HasPrefix(c1, "10.") || !strings.HasSuffix(c1, ".0.0/24") {
+		t.Errorf("expected format 10.X.0.0/24, got %q", c1)
+	}
+}
+
+
 

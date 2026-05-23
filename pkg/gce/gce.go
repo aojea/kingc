@@ -198,6 +198,11 @@ func (c *Client) NetworkExists(ctx context.Context, name string) bool {
 	return err == nil
 }
 
+func (c *Client) SubnetExists(ctx context.Context, name, region string) bool {
+	_, err := c.RunQuiet(ctx, "compute", "networks", "subnets", "describe", name, "--region", region)
+	return err == nil
+}
+
 func (c *Client) CreateNetwork(ctx context.Context, name string, autoMode bool, mtu int, profile string) error {
 	mode := "custom"
 	if autoMode {
@@ -540,4 +545,53 @@ func (c *Client) ImageExists(ctx context.Context, project, name string) bool {
 	_, err := c.RunQuiet(ctx, "compute", "images", "describe", name, "--project", project)
 	return err == nil
 }
+
+func (c *Client) CreateTPUVM(ctx context.Context, name, zone, accelType, runtimeVer string, spot bool, startupScript string, tags []string) error {
+	args := []string{
+		"compute", "tpus", "tpu-vm", "create", name,
+		"--zone", zone,
+		"--accelerator-type", accelType,
+		"--version", runtimeVer,
+	}
+	if spot {
+		args = append(args, "--spot")
+	}
+	if len(tags) > 0 {
+		args = append(args, "--tags", strings.Join(tags, ","))
+	}
+	if startupScript != "" {
+		args = append(args, "--metadata-from-file", fmt.Sprintf("startup-script=%s", startupScript))
+	}
+
+	_, err := c.Run(ctx, args...)
+	return err
+}
+
+func (c *Client) DeleteTPUVM(ctx context.Context, name, zone string) error {
+	_, err := c.Run(ctx, "compute", "tpus", "tpu-vm", "delete", name, "--zone", zone, "--quiet")
+	return err
+}
+
+func (c *Client) ListTPULocations(ctx context.Context) ([]string, error) {
+	out, err := c.RunQuiet(ctx, "compute", "tpus", "locations", "list", "--format=value(locationId)")
+	if err != nil {
+		return nil, err
+	}
+	return strings.Fields(out), nil
+}
+
+func (c *Client) DescribeAcceleratorType(ctx context.Context, accelType, zone string) bool {
+	_, err := c.RunQuiet(ctx, "compute", "tpus", "accelerator-types", "describe", accelType, "--zone", zone)
+	return err == nil
+}
+
+func (c *Client) TPUVMSSH(ctx context.Context, name, zone string, cmd []string) error {
+	args := []string{"compute", "tpus", "tpu-vm", "ssh", name, "--zone", zone}
+	if len(cmd) > 0 {
+		args = append(args, "--command", strings.Join(cmd, " "))
+	}
+	_, err := c.Run(ctx, args...)
+	return err
+}
+
 

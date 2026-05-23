@@ -11,8 +11,8 @@ const (
 	DefaultRegion                  = "us-central1"
 	DefaultZone                    = "us-central1-a"
 	DefaultKubernetesVersion       = "v1.35.0"
-	DefaultControlPlaneMachineType = "n1-standard-2"
-	DefaultWorkerMachineType       = "n1-standard-2"
+	DefaultControlPlaneMachineType = "e2-standard-2"
+	DefaultWorkerMachineType       = "e2-standard-2"
 	DefaultDiskSizeGB              = 50
 	DefaultWorkerReplicas          = 2
 
@@ -47,27 +47,35 @@ func (c *Cluster) SetDefaults() {
 			Name: DefaultNetworkName,
 			Subnets: []SubnetSpec{{
 				Name:   DefaultSubnetName,
-				CIDR:   DefaultSubnetCIDR,
-				Region: c.Spec.Region, // Default subnet in cluster region
+				CIDR:   deriveSubnetCIDR(c.Spec.Region),
+				Region: c.Spec.Region,
 			}},
 		}}
 	} else {
-		// Ensure subnets have region defaulted
+		// Ensure subnets have region and CIDR defaulted
 		for i := range c.Spec.Networks {
 			for j := range c.Spec.Networks[i].Subnets {
 				if c.Spec.Networks[i].Subnets[j].Region == "" {
 					c.Spec.Networks[i].Subnets[j].Region = c.Spec.Region
+				}
+				if c.Spec.Networks[i].Subnets[j].CIDR == "" {
+					c.Spec.Networks[i].Subnets[j].CIDR = deriveSubnetCIDR(c.Spec.Networks[i].Subnets[j].Region)
 				}
 			}
 		}
 	}
 
 	// Control Plane Defaults
-	c.applyNodeGroupDefaults(&c.Spec.ControlPlane)
+	c.applyNodeGroupDefaults(&c.Spec.ControlPlane, true)
 
 	// Worker Groups Defaults
 	for i := range c.Spec.WorkerGroups {
-		c.applyNodeGroupDefaults(&c.Spec.WorkerGroups[i])
+		c.applyNodeGroupDefaults(&c.Spec.WorkerGroups[i], false)
+	}
+
+	// TPU Groups Defaults
+	for i := range c.Spec.TPUGroups {
+		c.applyTPUGroupDefaults(&c.Spec.TPUGroups[i])
 	}
 
 	// Kubernetes Defaults
@@ -79,31 +87,58 @@ func (c *Cluster) SetDefaults() {
 	}
 }
 
-func (c *Cluster) applyNodeGroupDefaults(ng *NodeGroup) {
+func (c *Cluster) applyNodeGroupDefaults(ng *NodeGroup, isControlPlane bool) {
 	if ng.Region == "" {
 		ng.Region = c.Spec.Region
+	}
+	if ng.Name == "" {
+		if isControlPlane {
+			ng.Name = DefaultControlPlaneName
+		} else {
+			ng.Name = DefaultWorkerGroupName
+		}
+	}
+	if ng.MachineType == "" {
+		if isControlPlane {
+			ng.MachineType = DefaultControlPlaneMachineType
+		} else {
+			ng.MachineType = DefaultWorkerMachineType
+		}
+	}
+	if ng.DiskSizeGB == 0 {
+		ng.DiskSizeGB = DefaultDiskSizeGB
 	}
 
 	defaultZone := fmt.Sprintf("%s-a", c.Spec.Region)
 
-	// If Zone is empty, it remains empty -> Regional (unless we enforce zonal default?)
-	// "If both are empty, defaults to Cluster Region + default zone logic."
-	// So if user didn't specify ANYTHING, we probably want a Zonal default for simplicity?
-	// Or maybe Regional default?
-	// The prompt says: "If both are empty, defaults to Cluster Region + default zone logic."
-	// "default zone logic" usually implies picking a zone.
 	if ng.Zone == "" {
-		// Check if user INTENDED Regional. Even if Region was defaulted above.
-		// Currently we defaulted Region.
-		// If original config had NO Region and NO Zone, we probably want single zone (Zonal).
-		// If original had Region but NO Zone, we want Regional.
-		// Since we just set ng.Region, we can't distinguish "User set Region" vs "We defaulted Region" easily unless we check before.
-		// Re-reading: "If Zone is empty and Region is set, the group is Regional"
-		// But for CP, we usually want Zonal for single-replica or Regional for HA.
-		// Let's assume Zonal default if nothing specified for MVP/Simplicity, matching previous behavior.
 		ng.Zone = defaultZone
 	}
 	if ng.Replicas == 0 {
 		ng.Replicas = 1
 	}
 }
+
+func (c *Cluster) applyTPUGroupDefaults(tg *TPUGroup) {
+	if tg.Zone == "" {
+		tg.Zone = fmt.Sprintf("%s-a", c.Spec.Region)
+	}
+	if tg.Replicas == 0 {
+		tg.Replicas = 1
+	}
+	if tg.Spot == nil {
+		trueVal := true
+		tg.Spot = &trueVal
+	}
+}
+
+func deriveSubnetCIDR(region string) string {
+	hash := 0
+	for _, char := range region {
+		hash += int(char)
+	}
+	secondOctet := (hash % 250) + 1 // 1-250
+	return fmt.Sprintf("10.%d.0.0/24", secondOctet)
+}
+
+

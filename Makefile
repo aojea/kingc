@@ -12,7 +12,7 @@ export GOROOT GO111MODULE CGO_ENABLED
 
 
 build:
-	go build -v -o "$(OUT_DIR)/$(KIND_CLOUD_BINARY_NAME)" $(KIND_CLOUD_BUILD_FLAGS) cmd/kingc/main.go
+	go build -v -o "$(OUT_DIR)/$(KIND_CLOUD_BINARY_NAME)" $(KIND_CLOUD_BUILD_FLAGS) ./cmd/kingc
 
 clean:
 	rm -rf "$(OUT_DIR)/"

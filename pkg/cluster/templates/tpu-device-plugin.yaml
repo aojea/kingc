@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tpu-device-plugin
+  namespace: kube-system
+  labels:
+    k8s-app: tpu-device-plugin
+spec:
+  selector:
+    matchLabels:
+      name: tpu-device-plugin
+  template:
+    metadata:
+      labels:
+        name: tpu-device-plugin
+    spec:
+      hostNetwork: true
+      priorityClassName: system-node-critical
+      tolerations:
+      - operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: tpu-device-plugin
+        image: gcr.io/gke-release/tpu-device-plugin:v2-20231109
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: device-plugin
+          mountPath: /var/lib/kubelet/device-plugins
+        - name: sysfs
+          mountPath: /sys
+      volumes:
+      - name: device-plugin
+        hostPath:
+          path: /var/lib/kubelet/device-plugins
+      - name: sysfs
+        hostPath:
+          path: /sys

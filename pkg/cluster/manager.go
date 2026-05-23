@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -127,8 +128,11 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 				if err := m.gce.CreateNetwork(ctx, netName, isAuto, net.MTU, net.Profile); err != nil {
 					return err
 				}
-				for _, sub := range net.Subnets {
-					if err := m.gce.CreateSubnet(ctx, sub.Name, netName, cfg.Spec.Region, sub.CIDR); err != nil {
+			}
+			for _, sub := range net.Subnets {
+				// Use subnet spec's Region since it defaults to cluster region
+				if !m.gce.SubnetExists(ctx, sub.Name, sub.Region) {
+					if err := m.gce.CreateSubnet(ctx, sub.Name, netName, sub.Region, sub.CIDR); err != nil {
 						return err
 					}
 				}
@@ -140,6 +144,11 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 		return nil
 	}(); err != nil {
 		return err
+	}
+
+	projID, err := m.gce.GetCurrentProject(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get current project: %v", err)
 	}
 
 	// 1.5 Reserve Static IP for Control Plane VM
@@ -277,10 +286,12 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 	klog.Infof("ℹ️  Resolved GCE Image for Kubernetes %s: %s/%s", cfg.Spec.Kubernetes.Version, imageProject, imageName)
 
 	// 4. Provision Control Plane and Worker pools concurrently
-	errCh := make(chan error, 2)
+	// 4. Provision Control Plane, Workers and TPU groups concurrently
+	numParallel := 2 + len(cfg.Spec.TPUGroups)
+	errCh := make(chan error, numParallel)
 	{
-		defer m.measure("Control Plane and Worker Provisioning")()
-		klog.Infof("  > Provisioning Control Plane VM and Worker Groups in parallel...")
+		defer m.measure("Control Plane, Workers and TPU Provisioning")()
+		klog.Infof("  > Provisioning Control Plane VM, Worker Groups and TPU Groups in parallel...")
 
 		// Control Plane VM Provisioning
 		go func() {
@@ -314,11 +325,11 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 							return
 						}
 						networks = append(networks, netName)
-						subnets = append(subnets, subName)
+						subnets = append(subnets, fmt.Sprintf("projects/%s/regions/%s/subnetworks/%s", projID, grp.Region, subName))
 					}
 				} else {
 					networks = []string{cpNet}
-					subnets = []string{cpSub}
+					subnets = []string{fmt.Sprintf("projects/%s/regions/%s/subnetworks/%s", projID, grp.Region, cpSub)}
 				}
 
 				tmplName := fmt.Sprintf("%s-%s-tmpl", cfg.Metadata.Name, grp.Name)
@@ -344,8 +355,109 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 			errCh <- nil
 		}()
 
+		// TPU Groups Provisioning
+		for _, tgp := range cfg.Spec.TPUGroups {
+			go func(tg config.TPUGroup) {
+				klog.Infof("    - [Parallel TPUs] Provisioning TPU group %s (%d replicas, type %s)...", tg.Name, tg.Replicas, tg.AcceleratorType)
+
+				tZone := tg.Zone
+				if tZone == "" {
+					klog.Infof("🔍 TPU group %s has no explicit zone. Dynamic zone capacity hunting enabled...", tg.Name)
+					supportedZones, err := m.findSupportedZones(ctx, tg.AcceleratorType)
+					if err != nil {
+						errCh <- fmt.Errorf("tpu zone hunting failed: %v", err)
+						return
+					}
+
+					success := false
+					for _, sz := range supportedZones {
+						klog.Infof("🔍 Attempting to secure TPU Spot capacity in %s...", sz)
+
+						tRegion := sz[:len(sz)-2]
+						if err := m.ensureSubnetwork(ctx, cpNet, cpSub, tRegion); err != nil {
+							klog.Warningf("      ⚠️  Failed to ensure subnet in region %s: %v", tRegion, err)
+							continue
+						}
+
+						tpuName := fmt.Sprintf("%s-%s-1", cfg.Metadata.Name, tg.Name)
+						err = m.gce.CreateTPUVM(
+							ctx,
+							tpuName, sz,
+							tg.AcceleratorType, config.MapTPURuntimeVersion(tg.AcceleratorType),
+							tg.Spot != nil && *tg.Spot, tmpWorkerStartup,
+							[]string{
+								basename(cfg.Metadata.Name),
+								"kingc-role-worker",
+								"kingc-tpu-group-" + tg.Name,
+							},
+						)
+						if err == nil {
+							klog.Infof("✅ SUCCESS: Secured TPU Spot capacity in %s!", sz)
+							tZone = sz
+							success = true
+
+							for i := 2; i <= tg.Replicas; i++ {
+								repName := fmt.Sprintf("%s-%s-%d", cfg.Metadata.Name, tg.Name, i)
+								if err := m.gce.CreateTPUVM(
+									ctx,
+									repName, tZone,
+									tg.AcceleratorType, config.MapTPURuntimeVersion(tg.AcceleratorType),
+									tg.Spot != nil && *tg.Spot, tmpWorkerStartup,
+									[]string{
+										basename(cfg.Metadata.Name),
+										"kingc-role-worker",
+										"kingc-tpu-group-" + tg.Name,
+									},
+								); err != nil {
+									errCh <- fmt.Errorf("failed to create TPU replica VM %s in %s: %v", repName, tZone, err)
+									return
+								}
+							}
+							break
+						} else {
+							klog.Warningf("❌ FAIL: Could not secure TPU in %s: %v", sz, err)
+						}
+					}
+
+					if !success {
+						errCh <- fmt.Errorf("could not secure TPU spot capacity in any supported zones for %s", tg.AcceleratorType)
+						return
+					}
+				} else {
+					rVersion := tg.RuntimeVersion
+					if rVersion == "" {
+						rVersion = config.MapTPURuntimeVersion(tg.AcceleratorType)
+					}
+					tRegion := tZone[:len(tZone)-2]
+					if err := m.ensureSubnetwork(ctx, cpNet, cpSub, tRegion); err != nil {
+						errCh <- err
+						return
+					}
+					for i := 1; i <= tg.Replicas; i++ {
+						tpuName := fmt.Sprintf("%s-%s-%d", cfg.Metadata.Name, tg.Name, i)
+						err := m.gce.CreateTPUVM(
+							ctx,
+							tpuName, tZone,
+							tg.AcceleratorType, rVersion,
+							tg.Spot != nil && *tg.Spot, tmpWorkerStartup,
+							[]string{
+								basename(cfg.Metadata.Name),
+								"kingc-role-worker",
+								"kingc-tpu-group-" + tg.Name,
+							},
+						)
+						if err != nil {
+							errCh <- err
+							return
+						}
+					}
+				}
+				errCh <- nil
+			}(tgp)
+		}
+
 		// Await concurrency completion
-		for i := 0; i < 2; i++ {
+		for i := 0; i < numParallel; i++ {
 			if err := <-errCh; err != nil {
 				return fmt.Errorf("parallel provisioning step failed: %v", err)
 			}
@@ -429,6 +541,29 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 			}
 		} else {
 			klog.Infof("    - Skipping default CNI (disabled in config)")
+		}
+	}
+
+	// Install Google Cloud TPU Device Plugin (if TPU groups are defined)
+	if len(cfg.Spec.TPUGroups) > 0 {
+		defer m.measure("Install TPU Device Plugin")()
+		klog.Infof("  > Installing Google Cloud TPU Device Plugin...")
+		
+		tpuPluginManifest, err := m.renderTemplate("templates/tpu-device-plugin.yaml", templateData)
+		if err != nil {
+			return err
+		}
+		
+		tmpTPUPlugin := filepath.Join(tmpDir, "tpu-device-plugin.yaml")
+		if err := os.WriteFile(tmpTPUPlugin, []byte(tpuPluginManifest), 0644); err != nil {
+			return err
+		}
+		
+		cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", localKubeconfig, "apply", "-f", tmpTPUPlugin)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			klog.Warningf("    ⚠️  Failed to install GCP TPU Device Plugin: %v\nOutput: %s", err, out)
+		} else {
+			klog.Infof("    ✅ Successfully applied Google Cloud TPU Device Plugin DaemonSet")
 		}
 	}
 
@@ -533,6 +668,38 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 					errs = append(errs, fmt.Errorf("delete instance %s: %w", inst.Name, err))
 				} else {
 					klog.Infof("    ✅ Done")
+				}
+			}
+		}
+		return nil
+	}(); err != nil {
+		// do not fail on delete
+	}
+
+	// Delete TPU VMs
+	if err := func() error {
+		defer m.measure("TPU VMs Cleanup")()
+		klog.Infof("  > Cleaning up TPU VMs...")
+		out, err := m.gce.RunQuiet(ctx, "compute", "tpus", "tpu-vm", "list", fmt.Sprintf("--filter=name:%s*", name), "--format=value(name,zone)")
+		if err != nil {
+			klog.Warningf("    ⚠️  Failed to list TPU VMs: %v", err)
+		} else {
+			lines := strings.Split(strings.TrimSpace(out), "\n")
+			for _, line := range lines {
+				fields := strings.Fields(line)
+				if len(fields) >= 2 {
+					tpuName := fields[0]
+					tpuZone := fields[1]
+					parts := strings.Split(tpuZone, "/")
+					tpuZone = parts[len(parts)-1]
+					
+					klog.Infof("  > Deleting TPU VM %s in %s...", tpuName, tpuZone)
+					if err := m.gce.DeleteTPUVM(ctx, tpuName, tpuZone); err != nil && !gce.IsNotFoundError(err) {
+						klog.Warningf("    ⚠️  Failed: %v", err)
+						errs = append(errs, fmt.Errorf("delete TPU VM %s: %w", tpuName, err))
+					} else {
+						klog.Infof("    ✅ Done")
+					}
 				}
 			}
 		}
@@ -733,4 +900,67 @@ func (m *Manager) waitForAPIServer(ctx context.Context, uri *url.URL, timeout ti
 		case <-time.After(5 * time.Second):
 		}
 	}
+}
+
+func (m *Manager) findSupportedZones(ctx context.Context, accelType string) ([]string, error) {
+	locations, err := m.gce.ListTPULocations(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var usZones, euroZones, otherZones []string
+	for _, loc := range locations {
+		if strings.HasPrefix(loc, "us-") {
+			usZones = append(usZones, loc)
+		} else if strings.HasPrefix(loc, "europe-") {
+			euroZones = append(euroZones, loc)
+		} else {
+			otherZones = append(otherZones, loc)
+		}
+	}
+	orderedZones := append(usZones, append(euroZones, otherZones...)...)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var supportedZones []string
+
+	for _, zone := range orderedZones {
+		wg.Add(1)
+		go func(z string) {
+			defer wg.Done()
+			if m.gce.DescribeAcceleratorType(ctx, accelType, z) {
+				mu.Lock()
+				supportedZones = append(supportedZones, z)
+				mu.Unlock()
+			}
+		}(zone)
+	}
+	wg.Wait()
+
+	var finalSupported []string
+	for _, z := range orderedZones {
+		for _, sz := range supportedZones {
+			if sz == z {
+				finalSupported = append(finalSupported, sz)
+				break
+			}
+		}
+	}
+
+	return finalSupported, nil
+}
+
+func (m *Manager) ensureSubnetwork(ctx context.Context, network, subnetBase, region string) error {
+	hash := 0
+	for _, char := range region {
+		hash += int(char)
+	}
+	secondOctet := (hash % 250) + 1
+	cidr := fmt.Sprintf("10.%d.0.0/24", secondOctet)
+
+	if !m.gce.SubnetExists(ctx, subnetBase, region) {
+		klog.Infof("🏗️  [Dynamic Subnet] Creating regional subnet %s (%s) on %s in region %s...", subnetBase, cidr, network, region)
+		return m.gce.CreateSubnet(ctx, subnetBase, network, region, cidr)
+	}
+	return nil
 }
