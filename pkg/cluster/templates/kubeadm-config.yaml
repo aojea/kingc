@@ -56,8 +56,7 @@ discovery:
   bootstrapToken:
     apiServerEndpoint: "{{ .ControlPlaneEndpoint }}"
     token: "{{ .BootstrapToken }}"
-    caCertHashes:
-    - "{{ .DiscoveryTokenCaCertHash }}"
+    unsafeSkipCAVerification: true
 nodeRegistration:
   kubeletExtraArgs:
     # Cloud Provider External

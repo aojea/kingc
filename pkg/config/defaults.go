@@ -25,8 +25,8 @@ const (
 	DefaultControlPlaneName = "control-plane"
 	DefaultWorkerGroupName  = "workers"
 
-	DefaultImageProject   = "ubuntu-os-cloud"
-	DefaultImageFamily    = "ubuntu-2204-lts"
+	DefaultImageProject   = "k8s-staging-cluster-api-gcp"
+	DefaultImageFamily    = "cluster-api-ubuntu-2404-v1-35-5-nightly"
 	DefaultAPIServerImage = "aojea/kingc-apiserver:latest"
 )
 

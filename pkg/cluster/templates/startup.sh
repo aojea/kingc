@@ -1,4 +1,4 @@
-#! /bin/bash
+#!/bin/bash
 set -euo pipefail
 
 # Enable IP forwarding (Kubernetes Requirement)
@@ -8,50 +8,63 @@ echo "net.ipv4.ip_forward=1" | tee -a /etc/sysctl.conf
 
 sysctl --system
 
-# Install Containerd (Dynamic OS Detection)
-apt-get update
-apt-get install -y ca-certificates curl gnupg lsb-release
+# Wrapper function to allow clean early-return without terminating the whole startup-script
+install_dependencies() {
+    if command -v kubeadm &> /dev/null; then
+        echo "🚀 kubeadm is already installed. Skipping package installation steps."
+        return 0
+    fi
 
-install -m 0755 -d /etc/apt/keyrings
+    echo "📦 kubeadm not found. Installing packages..."
 
-. /etc/os-release
-DISTRO_ID=$ID
-if [ "$DISTRO_ID" != "debian" ] && [ "$DISTRO_ID" != "ubuntu" ]; then
-    DISTRO_ID="ubuntu"
-fi
+    # Install Containerd (Dynamic OS Detection)
+    apt-get update
+    apt-get install -y ca-certificates curl gnupg lsb-release
 
-curl -fsSL "https://download.docker.com/linux/$DISTRO_ID/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-chmod a+r /etc/apt/keyrings/docker.gpg
+    install -m 0755 -d /etc/apt/keyrings
 
-echo \
-  "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$DISTRO_ID \
-  "$VERSION_CODENAME" stable" | \
-  tee /etc/apt/sources.list.d/docker.list > /dev/null
+    . /etc/os-release
+    DISTRO_ID=$ID
+    if [ "$DISTRO_ID" != "debian" ] && [ "$DISTRO_ID" != "ubuntu" ]; then
+        DISTRO_ID="ubuntu"
+    fi
 
-apt-get update
-apt-get install -y containerd.io
+    curl -fsSL "https://download.docker.com/linux/$DISTRO_ID/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
 
-mkdir -p /etc/containerd
-containerd config default > /etc/containerd/config.toml
-sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-systemctl restart containerd
+    echo \
+      "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$DISTRO_ID \
+      "$VERSION_CODENAME" stable" | \
+      tee /etc/apt/sources.list.d/docker.list > /dev/null
 
-# Install Kubeadm/Kubelet/Kubectl
-# Version is injected by kingc based on config
-KUBERNETES_VERSION="{{ .KubernetesVersion }}"
-KUBERNETES_REPO_VERSION="{{ .KubernetesRepoVersion }}"
+    apt-get update
+    apt-get install -y containerd.io
 
-curl -fsSL "https://pkgs.k8s.io/core:/stable:/${KUBERNETES_REPO_VERSION}/deb/Release.key" | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${KUBERNETES_REPO_VERSION}/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list
+    mkdir -p /etc/containerd
+    containerd config default > /etc/containerd/config.toml
+    sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+    systemctl restart containerd
 
-apt-get update
-apt-get install -y kubelet kubeadm kubectl
-apt-mark hold kubelet kubeadm kubectl
+    # Install Kubeadm/Kubelet/Kubectl
+    # Version is injected by kingc based on config
+    KUBERNETES_VERSION="{{ .KubernetesVersion }}"
+    KUBERNETES_REPO_VERSION="{{ .KubernetesRepoVersion }}"
 
-# Install cri-tools (crictl)
-curl -L "https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz" -o crictl.tar.gz
-tar zxvf crictl.tar.gz -C /usr/local/bin
-rm -f crictl.tar.gz
+    curl -fsSL "https://pkgs.k8s.io/core:/stable:/${KUBERNETES_REPO_VERSION}/deb/Release.key" | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${KUBERNETES_REPO_VERSION}/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list
 
-# Create crictl config
-echo "runtime-endpoint: unix:///run/containerd/containerd.sock" > /etc/crictl.yaml
+    apt-get update
+    apt-get install -y kubelet kubeadm kubectl
+    apt-mark hold kubelet kubeadm kubectl
+
+    # Install cri-tools (crictl)
+    curl -L "https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.36.0/crictl-v1.36.0-linux-amd64.tar.gz" -o crictl.tar.gz
+    tar zxvf crictl.tar.gz -C /usr/local/bin
+    rm -f crictl.tar.gz
+
+    # Create crictl config
+    echo "runtime-endpoint: unix:///run/containerd/containerd.sock" > /etc/crictl.yaml
+}
+
+# Execute package installations
+install_dependencies

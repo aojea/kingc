@@ -273,7 +273,7 @@ func (c *Client) CreateInstance(ctx context.Context, name, zone, machineType, ne
 		"--machine-type", machineType,
 		"--network", network,
 		"--subnet", subnet,
-		"--image-family", image,
+		"--image", image,
 		"--image-project", config.DefaultImageProject,
 		"--boot-disk-size", "50GB",
 		"--scopes", "cloud-platform",
@@ -424,7 +424,7 @@ func (c *Client) CreateInstanceTemplate(ctx context.Context, name, machineType s
 	args := []string{
 		"compute", "instance-templates", "create", name,
 		"--machine-type", machineType,
-		"--image-family", image,
+		"--image", image,
 		"--image-project", config.DefaultImageProject,
 		"--boot-disk-size", "50GB",
 		"--scopes", "cloud-platform",

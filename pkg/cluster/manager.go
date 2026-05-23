@@ -221,13 +221,13 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 	}
 
 	// Render kubeadm config
-	kubeadmConfigDummy, err := m.renderTemplate("templates/kubeadm-config.yaml", templateData)
+	kubeadmConfig, err := m.renderTemplate("templates/kubeadm-config.yaml", templateData)
 	if err != nil {
 		return err
 	}
 	if len(cfg.Spec.KubeadmConfigPatches) > 0 {
 		for _, patch := range cfg.Spec.KubeadmConfigPatches {
-			kubeadmConfigDummy = kubeadmConfigDummy + "\n---\n" + patch
+			kubeadmConfig = kubeadmConfig + "\n---\n" + patch
 		}
 	}
 
@@ -246,30 +246,105 @@ echo "👑 kingc: Running Kubeadm Init..."
 kubeadm init --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-errors=NumCPU
 
 echo "👑 kingc: Control Plane Bootstrapped"
-`, baseInstallScript, kubeadmConfigDummy)
+`, baseInstallScript, kubeadmConfig)
 
 	tmpCPStartup := filepath.Join(tmpDir, "cp-startup.sh")
 	if err := os.WriteFile(tmpCPStartup, []byte(cpStartupScript), 0644); err != nil {
 		return fmt.Errorf("failed to write startup script: %v", err)
 	}
 
-	// 4. Provision Control Plane
+	workerStartup := fmt.Sprintf(`%s
+
+# ---------------------------------------------------------
+# Worker Bootstrap
+# ---------------------------------------------------------
+echo "👑 kingc: Writing kubeadm config..."
+mkdir -p /etc/kubernetes
+cat <<EOF > /etc/kubernetes/kubeadm-config.yaml
+%s
+EOF
+echo "👑 kingc: Joining cluster..."
+kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-errors=NumCPU
+`, baseInstallScript, kubeadmConfig)
+
+	tmpWorkerStartup := filepath.Join(tmpDir, "worker-startup.sh")
+	if err := os.WriteFile(tmpWorkerStartup, []byte(workerStartup), 0644); err != nil {
+		return fmt.Errorf("failed to write worker startup script: %v", err)
+	}
+
+	// 4. Provision Control Plane and Worker pools concurrently
+	errCh := make(chan error, 2)
 	{
-		defer m.measure("Control Plane Provisioning")()
-		klog.Infof("  > Provisioning Control Plane VM (%s) with IP %s...", cpZone, cpIP)
-		err = m.gce.CreateInstance(
-			ctx,
-			cpName, cpZone, cfg.Spec.ControlPlane.MachineType,
-			cpNet, cpSub,
-			config.DefaultImageFamily, "", tmpCPStartup,
-			cpIP, "",
-			[]string{
-				basename(cfg.Metadata.Name),
-				"kingc-role-control-plane",
-			},
-		)
-		if err != nil {
-			klog.Warningf("    (Instance warning: %v)", err)
+		defer m.measure("Control Plane and Worker Provisioning")()
+		klog.Infof("  > Provisioning Control Plane VM and Worker Groups in parallel...")
+
+		// Control Plane VM Provisioning
+		go func() {
+			klog.Infof("    - [Parallel CP] Launching CP VM (%s) with IP %s...", cpZone, cpIP)
+			err := m.gce.CreateInstance(
+				ctx,
+				cpName, cpZone, cfg.Spec.ControlPlane.MachineType,
+				cpNet, cpSub,
+				config.DefaultImageFamily, "", tmpCPStartup,
+				cpIP, "",
+				[]string{
+					basename(cfg.Metadata.Name),
+					"kingc-role-control-plane",
+				},
+			)
+			errCh <- err
+		}()
+
+		// Worker Groups Provisioning
+		go func() {
+			klog.Infof("    - [Parallel Workers] Launching Worker templates and MIG groups...")
+			for _, grp := range cfg.Spec.WorkerGroups {
+				var networks, subnets []string
+
+				if len(grp.Interfaces) > 0 {
+					for _, iface := range grp.Interfaces {
+						netName := iface.Network
+						subName, err := resolveSubnet(cfg.Spec.Networks, netName, iface.Subnet)
+						if err != nil {
+							errCh <- err
+							return
+						}
+						networks = append(networks, netName)
+						subnets = append(subnets, subName)
+					}
+				} else {
+					networks = []string{cpNet}
+					subnets = []string{cpSub}
+				}
+
+				tmplName := fmt.Sprintf("%s-%s-tmpl", cfg.Metadata.Name, grp.Name)
+				if err := m.gce.CreateInstanceTemplate(
+					ctx,
+					tmplName, grp.MachineType, networks, subnets,
+					config.DefaultImageFamily, tmpWorkerStartup,
+					[]string{
+						basename(cfg.Metadata.Name),
+						"kingc-role-worker",
+						"kingc-group-" + grp.Name,
+					},
+				); err != nil {
+					klog.Warningf("      ⚠️  Instance Template warning: %v", err)
+				}
+
+				migName := fmt.Sprintf("%s-%s-mig", cfg.Metadata.Name, grp.Name)
+				if err := m.gce.CreateMIG(ctx, migName, tmplName, grp.Zone, grp.Replicas); err != nil {
+					errCh <- err
+					return
+				}
+			}
+			errCh <- nil
+		}()
+
+		// Await concurrency completion
+		for i := 0; i < 2; i++ {
+			if err := <-errCh; err != nil {
+				return fmt.Errorf("parallel provisioning step failed: %v", err)
+			}
 		}
 	}
 
@@ -286,20 +361,14 @@ echo "👑 kingc: Control Plane Bootstrapped"
 		return err
 	}
 
-	// 6. Retrieve Kubeconfig and CA certificate from Control Plane VM
+	// 6. Retrieve Kubeconfig from Control Plane VM
 	var adminKubeconfig string
-	var caCert []byte
 	{
-		klog.Infof("  > Retrieving admin kubeconfig and CA cert from Control Plane VM...")
+		klog.Infof("  > Retrieving admin kubeconfig from Control Plane VM...")
 		adminKubeconfig, err = m.gce.RunSSHOutput(ctx, cpName, cpZone, "sudo cat /etc/kubernetes/admin.conf")
 		if err != nil {
 			return fmt.Errorf("failed to retrieve admin kubeconfig: %v", err)
 		}
-		caCertStr, err := m.gce.RunSSHOutput(ctx, cpName, cpZone, "sudo cat /etc/kubernetes/pki/ca.crt")
-		if err != nil {
-			return fmt.Errorf("failed to retrieve CA certificate: %v", err)
-		}
-		caCert = []byte(caCertStr)
 
 		localKubeconfig = filepath.Join(tmpDir, "admin.conf")
 		if err := os.WriteFile(localKubeconfig, []byte(adminKubeconfig), 0600); err != nil {
@@ -331,90 +400,7 @@ echo "👑 kingc: Control Plane Bootstrapped"
 		}
 	}
 
-	// 7. Calculate actual CA hash
-	caHash, err := calculateCACertHash(caCert)
-	if err != nil {
-		return fmt.Errorf("failed to calculate CA cert hash: %v", err)
-	}
-	templateData["DiscoveryTokenCaCertHash"] = caHash
-
-	// 8. Prepare worker startup configuration with correct CA hash
-	kubeadmConfigReal, err := m.renderTemplate("templates/kubeadm-config.yaml", templateData)
-	if err != nil {
-		return err
-	}
-	if len(cfg.Spec.KubeadmConfigPatches) > 0 {
-		for _, patch := range cfg.Spec.KubeadmConfigPatches {
-			kubeadmConfigReal = kubeadmConfigReal + "\n---\n" + patch
-		}
-	}
-
-	// 9. Worker Pools
-	{
-		defer m.measure("Worker Groups Provisioning")()
-		klog.Infof("  > Provisioning Worker Groups...")
-
-		workerStartup := fmt.Sprintf(`%s
-
-# ---------------------------------------------------------
-# Worker Bootstrap
-# ---------------------------------------------------------
-echo "👑 kingc: Writing kubeadm config..."
-mkdir -p /etc/kubernetes
-cat <<EOF > /etc/kubernetes/kubeadm-config.yaml
-%s
-EOF
-echo "👑 kingc: Joining cluster..."
-kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-errors=NumCPU
-`, baseInstallScript, kubeadmConfigReal)
-
-		tmpWorkerStartup := filepath.Join(tmpDir, "worker-startup.sh")
-		if err := os.WriteFile(tmpWorkerStartup, []byte(workerStartup), 0644); err != nil {
-			return fmt.Errorf("failed to write worker startup script: %v", err)
-		}
-
-		for _, grp := range cfg.Spec.WorkerGroups {
-			klog.Infof("    [%s] Creating Instance Template and MIG (%d replicas) in %s...", grp.Name, grp.Replicas, grp.Zone)
-
-			var networks, subnets []string
-
-			if len(grp.Interfaces) > 0 {
-				for _, iface := range grp.Interfaces {
-					netName := iface.Network
-					subName, err := resolveSubnet(cfg.Spec.Networks, netName, iface.Subnet)
-					if err != nil {
-						return err
-					}
-
-					networks = append(networks, netName)
-					subnets = append(subnets, subName)
-				}
-			} else {
-				networks = []string{cpNet}
-				subnets = []string{cpSub}
-			}
-
-			tmplName := fmt.Sprintf("%s-%s-tmpl", cfg.Metadata.Name, grp.Name)
-			if err := m.gce.CreateInstanceTemplate(
-				ctx,
-				tmplName, grp.MachineType, networks, subnets,
-				config.DefaultImageFamily, tmpWorkerStartup,
-				[]string{
-					basename(cfg.Metadata.Name),
-					"kingc-role-worker",
-					"kingc-group-" + grp.Name,
-				},
-			); err != nil {
-				klog.Warningf("    (Template warning: %v)", err)
-			}
-
-			migName := fmt.Sprintf("%s-%s-mig", cfg.Metadata.Name, grp.Name)
-			if err := m.gce.CreateMIG(ctx, migName, tmplName, grp.Zone, grp.Replicas); err != nil {
-				return err
-			}
-		}
-	}
-	// CNI and other addons
+	// Install CNI and other addons
 	{
 		defer m.measure("Install CNI")()
 		klog.Infof("  > Installing CNI...")
@@ -447,10 +433,6 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 	if err == nil {
 		if err := mergeKubeconfig(cfg.Metadata.Name, kcBytes); err != nil {
 			klog.Warningf("⚠️  Failed to merge kubeconfig: %v", err)
-			// Fallback: write local file if merge fails?
-			// Or just let user rely on the one in temp dir if they used --retain?
-			// The temp dir is deleted by default.
-			// Let's at least try to save it locally as fallback.
 			fallbackConfig := fmt.Sprintf("%s.conf", cfg.Metadata.Name)
 			if wErr := os.WriteFile(fallbackConfig, kcBytes, 0600); wErr == nil {
 				klog.Infof("    Saved config to ./%s", fallbackConfig)
