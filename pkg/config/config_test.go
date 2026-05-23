@@ -277,3 +277,44 @@ spec:
 		t.Errorf("Expected cp.name 'my-cp', got '%s'", cfg.Spec.ControlPlane.Name)
 	}
 }
+
+func TestResolveImage(t *testing.T) {
+	tests := []struct {
+		name            string
+		version         string
+		expectedProject string
+		expectedImage   string
+	}{
+		{
+			name:            "Prebaked version v1.35.5",
+			version:         "v1.35.5",
+			expectedProject: "k8s-staging-cluster-api-gcp",
+			expectedImage:   "cluster-api-ubuntu-2404-v1-35-5-nightly",
+		},
+		{
+			name:            "Prebaked version without leading v",
+			version:         "1.35.0",
+			expectedProject: "k8s-staging-cluster-api-gcp",
+			expectedImage:   "cluster-api-ubuntu-2404-v1-35-0-nightly",
+		},
+		{
+			name:            "Non-prebaked version fallback",
+			version:         "v1.33.0",
+			expectedProject: "ubuntu-os-cloud",
+			expectedImage:   "ubuntu-2404-lts-amd64",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			proj, img := ResolveImage(tt.version)
+			if proj != tt.expectedProject {
+				t.Errorf("expected project %q, got %q", tt.expectedProject, proj)
+			}
+			if img != tt.expectedImage {
+				t.Errorf("expected image %q, got %q", tt.expectedImage, img)
+			}
+		})
+	}
+}
+

@@ -272,6 +272,10 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 		return fmt.Errorf("failed to write worker startup script: %v", err)
 	}
 
+	// 3.5 Select GCE Image statically based on Kubernetes Version
+	imageProject, imageName := config.ResolveImage(cfg.Spec.Kubernetes.Version)
+	klog.Infof("ℹ️  Resolved GCE Image for Kubernetes %s: %s/%s", cfg.Spec.Kubernetes.Version, imageProject, imageName)
+
 	// 4. Provision Control Plane and Worker pools concurrently
 	errCh := make(chan error, 2)
 	{
@@ -285,7 +289,7 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 				ctx,
 				cpName, cpZone, cfg.Spec.ControlPlane.MachineType,
 				cpNet, cpSub,
-				config.DefaultImageFamily, "", tmpCPStartup,
+				imageProject, imageName, "", tmpCPStartup,
 				cpIP, "",
 				[]string{
 					basename(cfg.Metadata.Name),
@@ -321,7 +325,7 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 				if err := m.gce.CreateInstanceTemplate(
 					ctx,
 					tmplName, grp.MachineType, networks, subnets,
-					config.DefaultImageFamily, tmpWorkerStartup,
+					imageProject, imageName, tmpWorkerStartup,
 					[]string{
 						basename(cfg.Metadata.Name),
 						"kingc-role-worker",

@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/aojea/kingc/pkg/config"
 	"k8s.io/klog/v2"
 )
 
@@ -266,7 +265,7 @@ func (c *Client) DeleteStaticIP(ctx context.Context, name, region string) error 
 	return nil
 }
 
-func (c *Client) CreateInstance(ctx context.Context, name, zone, machineType, network, subnet, image, serviceAccount, startupScript, address, privateIP string, tags []string) error {
+func (c *Client) CreateInstance(ctx context.Context, name, zone, machineType, network, subnet, imageProject, image, serviceAccount, startupScript, address, privateIP string, tags []string) error {
 	args := []string{
 		"compute", "instances", "create", name,
 		"--zone", zone,
@@ -274,7 +273,7 @@ func (c *Client) CreateInstance(ctx context.Context, name, zone, machineType, ne
 		"--network", network,
 		"--subnet", subnet,
 		"--image", image,
-		"--image-project", config.DefaultImageProject,
+		"--image-project", imageProject,
 		"--boot-disk-size", "50GB",
 		"--scopes", "cloud-platform",
 		"--tags", strings.Join(tags, ","),
@@ -420,12 +419,12 @@ func (c *Client) SCP(ctx context.Context, localPath, remotePath, zone string) er
 	return cmd.Run()
 }
 
-func (c *Client) CreateInstanceTemplate(ctx context.Context, name, machineType string, networks, subnets []string, image, startupScript string, tags []string) error {
+func (c *Client) CreateInstanceTemplate(ctx context.Context, name, machineType string, networks, subnets []string, imageProject, image, startupScript string, tags []string) error {
 	args := []string{
 		"compute", "instance-templates", "create", name,
 		"--machine-type", machineType,
 		"--image", image,
-		"--image-project", config.DefaultImageProject,
+		"--image-project", imageProject,
 		"--boot-disk-size", "50GB",
 		"--scopes", "cloud-platform",
 		"--tags", strings.Join(tags, ","),
@@ -536,3 +535,9 @@ func (c *Client) GetInternalIP(ctx context.Context, name, zone string) (string, 
 	}
 	return strings.TrimSpace(out), nil
 }
+
+func (c *Client) ImageExists(ctx context.Context, project, name string) bool {
+	_, err := c.RunQuiet(ctx, "compute", "images", "describe", name, "--project", project)
+	return err == nil
+}
+
