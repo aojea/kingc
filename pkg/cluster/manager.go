@@ -372,8 +372,12 @@ mkdir -p /etc/kubernetes
 cat <<EOF > /etc/kubernetes/kubeadm-config.yaml
 %s
 EOF
-# Replace cloud-provider external flag with custom node-labels for TPU VM nodes
-sed -i 's/cloud-provider: "external"/node-labels: "kingc.role\/tpu=true,cloud.google.com\/gke-tpu-accelerator=%s"/' /etc/kubernetes/kubeadm-config.yaml
+
+# Fetch GCE instance name dynamically from metadata
+INSTANCE_NAME=\$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name)
+
+# Replace cloud-provider external flag with custom node-labels and hostname-override
+sed -i "s/cloud-provider: \"external\"/hostname-override: \"\${INSTANCE_NAME}\"\n    node-labels: \"kingc.role\/tpu=true,cloud.google.com\/gke-tpu-accelerator=%s\"/" /etc/kubernetes/kubeadm-config.yaml
 
 echo "👑 kingc: Joining cluster..."
 kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-errors=NumCPU
@@ -722,11 +726,13 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 			wg.Add(1)
 			go func(zone string) {
 				defer wg.Done()
-				out, err := m.gce.RunQuiet(ctx, "compute", "tpus", "tpu-vm", "list", "--zone", zone, fmt.Sprintf("--filter=name:%s*", name), "--format=value(name)")
+				out, err := m.gce.RunQuiet(ctx, "compute", "tpus", "tpu-vm", "list", "--zone", zone, "--format=value(name)")
 				if err == nil && strings.TrimSpace(out) != "" {
 					mu.Lock()
 					for _, tName := range strings.Fields(out) {
-						tpusToDelete = append(tpusToDelete, tpuInfo{tName, zone})
+						if strings.HasPrefix(tName, name) {
+							tpusToDelete = append(tpusToDelete, tpuInfo{tName, zone})
+						}
 					}
 					mu.Unlock()
 				}
