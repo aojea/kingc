@@ -120,9 +120,6 @@ func (c *Cluster) applyNodeGroupDefaults(ng *NodeGroup, isControlPlane bool) {
 }
 
 func (c *Cluster) applyTPUGroupDefaults(tg *TPUGroup) {
-	if tg.Zone == "" {
-		tg.Zone = fmt.Sprintf("%s-a", c.Spec.Region)
-	}
 	if tg.Replicas == 0 {
 		tg.Replicas = 1
 	}

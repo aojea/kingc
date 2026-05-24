@@ -99,6 +99,37 @@ func TestSetDefaults(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "TPU Group Defaults (Zone empty)",
+			input: &Cluster{
+				Spec: Spec{
+					Region: "us-central1",
+					TPUGroups: []TPUGroup{
+						{
+							Name:            "tpu1",
+							AcceleratorType: "v5litepod-8",
+						},
+					},
+				},
+			},
+			expected: &Cluster{
+				Spec: Spec{
+					Region: "us-central1",
+					ControlPlane: NodeGroup{
+						Region: "us-central1",
+						Zone:   "us-central1-a",
+					},
+					TPUGroups: []TPUGroup{
+						{
+							Name:            "tpu1",
+							AcceleratorType: "v5litepod-8",
+							Zone:            "", // Should remain empty for dynamic zone hunting
+							Replicas:        1,
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -115,6 +146,19 @@ func TestSetDefaults(t *testing.T) {
 			if len(tt.input.Spec.WorkerGroups) > 0 {
 				if tt.input.Spec.WorkerGroups[0].Zone != tt.expected.Spec.WorkerGroups[0].Zone {
 					t.Errorf("expected Worker Zone %s, got %s", tt.expected.Spec.WorkerGroups[0].Zone, tt.input.Spec.WorkerGroups[0].Zone)
+				}
+			}
+			if len(tt.input.Spec.TPUGroups) > 0 {
+				tgGot := tt.input.Spec.TPUGroups[0]
+				tgExp := tt.expected.Spec.TPUGroups[0]
+				if tgGot.Zone != tgExp.Zone {
+					t.Errorf("expected TPU Zone %q, got %q", tgExp.Zone, tgGot.Zone)
+				}
+				if tgGot.Replicas != tgExp.Replicas {
+					t.Errorf("expected TPU Replicas %d, got %d", tgExp.Replicas, tgGot.Replicas)
+				}
+				if tgGot.Spot == nil || *tgGot.Spot != true {
+					t.Errorf("expected TPU Spot to be true, got %v", tgGot.Spot)
 				}
 			}
 		})
