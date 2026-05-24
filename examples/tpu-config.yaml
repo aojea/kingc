@@ -1,22 +1,23 @@
 version: v1alpha1
 spec:
-  region: us-east1
+  region: us-south1
   kubernetes:
     version: v1.35.5
 
   controlPlane:
     name: cp
-    zone: us-east1-b
+    zone: us-south1-a
     machineType: e2-standard-2
 
   workerGroups:
   - name: cpu-workers
     replicas: 1
-    zone: us-east1-b
+    zone: us-south1-a
     machineType: e2-standard-2
 
   tpuGroups:
   - name: tpu-workers
     replicas: 1
     acceleratorType: v5litepod-8
+    zone: us-south1-a
     spot: false

@@ -401,6 +401,9 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 
 					success := false
 					for _, sz := range supportedZones {
+						if !strings.HasPrefix(sz, cfg.Spec.Region) {
+							continue
+						}
 						klog.Infof("🔍 Attempting to secure TPU Spot capacity in %s...", sz)
 
 						tRegion := sz[:len(sz)-2]
