@@ -159,7 +159,7 @@ func (c *Client) CheckGcloud() error {
 }
 
 func (c *Client) GetCurrentProject(ctx context.Context) (string, error) {
-	out, err := c.Run(ctx, "config", "get-value", "project")
+	out, err := c.RunQuiet(ctx, "config", "get-value", "project")
 	if err != nil {
 		return "", err
 	}
@@ -172,7 +172,7 @@ func (c *Client) GetCurrentProject(ctx context.Context) (string, error) {
 
 // GetDefaultZone attempts to read compute/zone from gcloud config
 func (c *Client) GetDefaultZone(ctx context.Context) string {
-	out, err := c.Run(ctx, "config", "get-value", "compute/zone")
+	out, err := c.RunQuiet(ctx, "config", "get-value", "compute/zone")
 	if err != nil {
 		return ""
 	}
@@ -181,7 +181,7 @@ func (c *Client) GetDefaultZone(ctx context.Context) string {
 
 // GetDefaultRegion attempts to read compute/region from gcloud config
 func (c *Client) GetDefaultRegion(ctx context.Context) string {
-	out, err := c.Run(ctx, "config", "get-value", "compute/region")
+	out, err := c.RunQuiet(ctx, "config", "get-value", "compute/region")
 	if err != nil {
 		return ""
 	}

@@ -17,9 +17,24 @@ install_dependencies() {
 
     echo "📦 kubeadm not found. Installing packages..."
 
+    # Robust apt-get wrapper that retries on lock acquisition failure or network issues
+    apt_get_retry() {
+        local count=0
+        local max_retries=5
+        until apt-get "$@"; do
+            if [ $count -eq $max_retries ]; then
+                echo "❌ Failed to run apt-get after $max_retries attempts."
+                return 1
+            fi
+            echo "🔒 apt-get was locked or failed. Retrying in 5 seconds ($count/$max_retries)..."
+            sleep 5
+            count=$((count + 1))
+        done
+    }
+
     # Install Containerd (Dynamic OS Detection)
-    apt-get update
-    apt-get install -y ca-certificates curl gnupg lsb-release
+    apt_get_retry update
+    apt_get_retry install -y ca-certificates curl gnupg lsb-release
 
     install -m 0755 -d /etc/apt/keyrings
 
@@ -37,8 +52,8 @@ install_dependencies() {
       "$VERSION_CODENAME" stable" | \
       tee /etc/apt/sources.list.d/docker.list > /dev/null
 
-    apt-get update
-    apt-get install -y containerd.io
+    apt_get_retry update
+    apt_get_retry install -y containerd.io
 
     mkdir -p /etc/containerd
     containerd config default > /etc/containerd/config.toml
@@ -53,8 +68,8 @@ install_dependencies() {
     curl -fsSL "https://pkgs.k8s.io/core:/stable:/${KUBERNETES_REPO_VERSION}/deb/Release.key" | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
     echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${KUBERNETES_REPO_VERSION}/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list
 
-    apt-get update
-    apt-get install -y kubelet kubeadm kubectl
+    apt_get_retry update
+    apt_get_retry install -y kubelet kubeadm kubectl
     apt-mark hold kubelet kubeadm kubectl
 
     # Install cri-tools (crictl)
