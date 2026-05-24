@@ -281,6 +281,8 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 		return fmt.Errorf("failed to write worker startup script: %v", err)
 	}
 
+
+
 	// 3.5 Select GCE Image statically based on Kubernetes Version
 	imageProject, imageName := config.ResolveImage(cfg.Spec.Kubernetes.Version)
 	klog.Infof("ℹ️  Resolved GCE Image for Kubernetes %s: %s/%s", cfg.Spec.Kubernetes.Version, imageProject, imageName)
@@ -360,6 +362,29 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 			go func(tg config.TPUGroup) {
 				klog.Infof("    - [Parallel TPUs] Provisioning TPU group %s (%d replicas, type %s)...", tg.Name, tg.Replicas, tg.AcceleratorType)
 
+				tpuStartup := fmt.Sprintf(`%s
+
+# ---------------------------------------------------------
+# TPU VM Bootstrap
+# ---------------------------------------------------------
+echo "👑 kingc: Writing kubeadm config..."
+mkdir -p /etc/kubernetes
+cat <<EOF > /etc/kubernetes/kubeadm-config.yaml
+%s
+EOF
+# Replace cloud-provider external flag with custom node-labels for TPU VM nodes
+sed -i 's/cloud-provider: "external"/node-labels: "kingc.role\/tpu=true,cloud.google.com\/gke-tpu-accelerator=%s"/' /etc/kubernetes/kubeadm-config.yaml
+
+echo "👑 kingc: Joining cluster..."
+kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-errors=NumCPU
+`, baseInstallScript, kubeadmConfig, tg.AcceleratorType)
+
+				tmpTPUStartup := filepath.Join(tmpDir, fmt.Sprintf("tpu-startup-%s.sh", tg.Name))
+				if err := os.WriteFile(tmpTPUStartup, []byte(tpuStartup), 0644); err != nil {
+					errCh <- fmt.Errorf("failed to write tpu startup script: %v", err)
+					return
+				}
+
 				tZone := tg.Zone
 				if tZone == "" {
 					klog.Infof("🔍 TPU group %s has no explicit zone. Dynamic zone capacity hunting enabled...", tg.Name)
@@ -378,13 +403,16 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 							klog.Warningf("      ⚠️  Failed to ensure subnet in region %s: %v", tRegion, err)
 							continue
 						}
+						tpuNet := fmt.Sprintf("projects/%s/global/networks/%s", projID, cpNet)
+						tpuSubnet := fmt.Sprintf("projects/%s/regions/%s/subnetworks/%s", projID, tRegion, cpSub)
 
 						tpuName := fmt.Sprintf("%s-%s-1", cfg.Metadata.Name, tg.Name)
 						err = m.gce.CreateTPUVM(
 							ctx,
 							tpuName, sz,
 							tg.AcceleratorType, config.MapTPURuntimeVersion(tg.AcceleratorType),
-							tg.Spot != nil && *tg.Spot, tmpWorkerStartup,
+							tpuNet, tpuSubnet,
+							tg.Spot != nil && *tg.Spot, tmpTPUStartup,
 							[]string{
 								basename(cfg.Metadata.Name),
 								"kingc-role-worker",
@@ -402,7 +430,8 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 									ctx,
 									repName, tZone,
 									tg.AcceleratorType, config.MapTPURuntimeVersion(tg.AcceleratorType),
-									tg.Spot != nil && *tg.Spot, tmpWorkerStartup,
+									tpuNet, tpuSubnet,
+									tg.Spot != nil && *tg.Spot, tmpTPUStartup,
 									[]string{
 										basename(cfg.Metadata.Name),
 										"kingc-role-worker",
@@ -433,13 +462,17 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 						errCh <- err
 						return
 					}
+					tpuNet := fmt.Sprintf("projects/%s/global/networks/%s", projID, cpNet)
+					tpuSubnet := fmt.Sprintf("projects/%s/regions/%s/subnetworks/%s", projID, tRegion, cpSub)
+
 					for i := 1; i <= tg.Replicas; i++ {
 						tpuName := fmt.Sprintf("%s-%s-%d", cfg.Metadata.Name, tg.Name, i)
 						err := m.gce.CreateTPUVM(
 							ctx,
 							tpuName, tZone,
 							tg.AcceleratorType, rVersion,
-							tg.Spot != nil && *tg.Spot, tmpWorkerStartup,
+							tpuNet, tpuSubnet,
+							tg.Spot != nil && *tg.Spot, tmpTPUStartup,
 							[]string{
 								basename(cfg.Metadata.Name),
 								"kingc-role-worker",

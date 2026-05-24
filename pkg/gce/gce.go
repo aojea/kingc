@@ -549,12 +549,18 @@ func (c *Client) ImageExists(ctx context.Context, project, name string) bool {
 	return err == nil
 }
 
-func (c *Client) CreateTPUVM(ctx context.Context, name, zone, accelType, runtimeVer string, spot bool, startupScript string, tags []string) error {
+func (c *Client) CreateTPUVM(ctx context.Context, name, zone, accelType, runtimeVer string, network, subnetwork string, spot bool, startupScript string, tags []string) error {
 	args := []string{
 		"compute", "tpus", "tpu-vm", "create", name,
 		"--zone", zone,
 		"--accelerator-type", accelType,
 		"--version", runtimeVer,
+	}
+	if network != "" {
+		args = append(args, "--network", network)
+	}
+	if subnetwork != "" {
+		args = append(args, "--subnetwork", subnetwork)
 	}
 	if spot {
 		args = append(args, "--spot")
