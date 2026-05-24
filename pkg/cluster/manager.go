@@ -374,10 +374,11 @@ cat <<EOF > /etc/kubernetes/kubeadm-config.yaml
 EOF
 
 # Fetch GCE instance name dynamically from metadata
-INSTANCE_NAME=\$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name)
+INSTANCE_NAME=$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name)
 
-# Replace cloud-provider external flag with custom node-labels and hostname-override
-sed -i "s/cloud-provider: \"external\"/hostname-override: \"\${INSTANCE_NAME}\"\n    node-labels: \"kingc.role\/tpu=true,cloud.google.com\/gke-tpu-accelerator=%s\"/" /etc/kubernetes/kubeadm-config.yaml
+# Replace cloud-provider external flag with hostname-override and add node-labels
+sed -i "s/cloud-provider: \"external\"/hostname-override: \"${INSTANCE_NAME}\"/" /etc/kubernetes/kubeadm-config.yaml
+sed -i "/hostname-override: /a \\    node-labels: \"kingc.role\/tpu=true,cloud.google.com\/gke-tpu-accelerator=%s\"" /etc/kubernetes/kubeadm-config.yaml
 
 echo "👑 kingc: Joining cluster..."
 kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-errors=NumCPU

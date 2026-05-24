@@ -31,6 +31,8 @@ spec:
           mountPath: /var/lib/kubelet/device-plugins
         - name: sysfs
           mountPath: /sys
+        - name: dev
+          mountPath: /dev
       volumes:
       - name: device-plugin
         hostPath:
@@ -38,3 +40,6 @@ spec:
       - name: sysfs
         hostPath:
           path: /sys
+      - name: dev
+        hostPath:
+          path: /dev
