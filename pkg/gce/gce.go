@@ -163,7 +163,8 @@ func (c *Client) GetCurrentProject(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	proj := strings.TrimSpace(out)
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	proj := strings.TrimSpace(lines[len(lines)-1])
 	if proj == "" {
 		return "", fmt.Errorf("no active project")
 	}
@@ -176,7 +177,8 @@ func (c *Client) GetDefaultZone(ctx context.Context) string {
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(out)
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	return strings.TrimSpace(lines[len(lines)-1])
 }
 
 // GetDefaultRegion attempts to read compute/region from gcloud config
@@ -185,7 +187,8 @@ func (c *Client) GetDefaultRegion(ctx context.Context) string {
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(out)
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	return strings.TrimSpace(lines[len(lines)-1])
 }
 
 func (c *Client) VerifyComputeAPI(ctx context.Context) error {

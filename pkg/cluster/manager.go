@@ -674,27 +674,40 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 	func() {
 		defer m.measure("TPU VMs Cleanup")()
 		klog.Infof("  > Cleaning up TPU VMs...")
-		out, err := m.gce.RunQuiet(ctx, "compute", "tpus", "tpu-vm", "list", fmt.Sprintf("--filter=name:%s*", name), "--format=value(name,zone)")
+		locations, err := m.gce.ListTPULocations(ctx)
 		if err != nil {
-			klog.Warningf("    ⚠️  Failed to list TPU VMs: %v", err)
-		} else {
-			lines := strings.Split(strings.TrimSpace(out), "\n")
-			for _, line := range lines {
-				fields := strings.Fields(line)
-				if len(fields) >= 2 {
-					tpuName := fields[0]
-					tpuZone := fields[1]
-					parts := strings.Split(tpuZone, "/")
-					tpuZone = parts[len(parts)-1]
-					
-					klog.Infof("  > Deleting TPU VM %s in %s...", tpuName, tpuZone)
-					if err := m.gce.DeleteTPUVM(ctx, tpuName, tpuZone); err != nil && !gce.IsNotFoundError(err) {
-						klog.Warningf("    ⚠️  Failed: %v", err)
-						errs = append(errs, fmt.Errorf("delete TPU VM %s: %w", tpuName, err))
-					} else {
-						klog.Infof("    ✅ Done")
+			klog.Warningf("    ⚠️  Failed to list TPU locations: %v", err)
+			return
+		}
+
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		type tpuInfo struct{ Name, Zone string }
+		var tpusToDelete []tpuInfo
+
+		for _, loc := range locations {
+			wg.Add(1)
+			go func(zone string) {
+				defer wg.Done()
+				out, err := m.gce.RunQuiet(ctx, "compute", "tpus", "tpu-vm", "list", "--zone", zone, fmt.Sprintf("--filter=name:%s*", name), "--format=value(name)")
+				if err == nil && strings.TrimSpace(out) != "" {
+					mu.Lock()
+					for _, tName := range strings.Fields(out) {
+						tpusToDelete = append(tpusToDelete, tpuInfo{tName, zone})
 					}
+					mu.Unlock()
 				}
+			}(loc)
+		}
+		wg.Wait()
+
+		for _, t := range tpusToDelete {
+			klog.Infof("  > Deleting TPU VM %s in %s...", t.Name, t.Zone)
+			if err := m.gce.DeleteTPUVM(ctx, t.Name, t.Zone); err != nil && !gce.IsNotFoundError(err) {
+				klog.Warningf("    ⚠️  Failed: %v", err)
+				errs = append(errs, fmt.Errorf("delete TPU VM %s: %w", t.Name, err))
+			} else {
+				klog.Infof("    ✅ Done")
 			}
 		}
 	}()
