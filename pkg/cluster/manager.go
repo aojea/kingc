@@ -591,7 +591,7 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 	var errs []error
 
 	// Delete Instance Groups
-	if err := func() error {
+	func() {
 		defer m.measure("Instance Groups Cleanup")()
 		klog.Infof("  > Cleaning up Instance Groups...")
 		filter := fmt.Sprintf("name:%s*", name)
@@ -620,13 +620,11 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 				}
 			}
 		}
-		return nil
-	}(); err != nil {
-		// do not fail on delete
-	}
+	}()
+
 
 	// Delete Instance Templates
-	if err := func() error {
+	func() {
 		defer m.measure("Instance Templates Cleanup")()
 		klog.Infof("  > Cleaning up Instance Templates...")
 		filter := fmt.Sprintf("name:%s*", name)
@@ -646,13 +644,11 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 				}
 			}
 		}
-		return nil
-	}(); err != nil {
-		// do not fail on delete
-	}
+	}()
+
 
 	// Delete Remaining Instances
-	if err := func() error {
+	func() {
 		defer m.measure("Instances Cleanup")()
 		// We also verify instances to find regions if address is missing
 		tags := []string{basename(name)}
@@ -671,13 +667,11 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 				}
 			}
 		}
-		return nil
-	}(); err != nil {
-		// do not fail on delete
-	}
+	}()
+
 
 	// Delete TPU VMs
-	if err := func() error {
+	func() {
 		defer m.measure("TPU VMs Cleanup")()
 		klog.Infof("  > Cleaning up TPU VMs...")
 		out, err := m.gce.RunQuiet(ctx, "compute", "tpus", "tpu-vm", "list", fmt.Sprintf("--filter=name:%s*", name), "--format=value(name,zone)")
@@ -703,14 +697,12 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 				}
 			}
 		}
-		return nil
-	}(); err != nil {
-		// do not fail on delete
-	}
+	}()
+
 
 	// Delete Firewall Rules
 	// Check if rules exist by trying to delete them and ignoring NotFound
-	if err := func() error {
+	func() {
 		defer m.measure("Firewall Rules Cleanup")()
 		klog.Infof("  > Deleting Firewall Rules...")
 		// Use basename for firewall rules as they are created with it
@@ -724,12 +716,11 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 		} else {
 			klog.Infof("    ✅ Done")
 		}
-		return nil
-	}(); err != nil {
-	}
+	}()
+
 
 	// Delete IP Addresses
-	if err := func() error {
+	func() {
 		defer m.measure("IP Addresses Cleanup")()
 		klog.Infof("  > Cleaning up IP Addresses...")
 		filter := fmt.Sprintf("name:kingc-cluster-%s*", name)
@@ -747,9 +738,8 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 				}
 			}
 		}
-		return nil
-	}(); err != nil {
-	}
+	}()
+
 
 	if len(errs) > 0 {
 		return fmt.Errorf("cleanup failed with %d errors: %v", len(errs), errs)
