@@ -397,5 +397,48 @@ func TestDeriveSubnetCIDR(t *testing.T) {
 	}
 }
 
+func TestTPUHelpers(t *testing.T) {
+	countTests := []struct {
+		tpuType  string
+		expected string
+	}{
+		{"v5litepod-8", "8"},
+		{"v5litepod-4", "4"},
+		{"v6e-4", "4"},
+		{"v5p-8", "8"},
+		{"v4", "4"}, // Fallback default
+	}
+
+	for _, tt := range countTests {
+		got := GetTPUChipCount(tt.tpuType)
+		if got != tt.expected {
+			t.Errorf("GetTPUChipCount(%q) = %q, expected %q", tt.tpuType, got, tt.expected)
+		}
+	}
+
+	topoTests := []struct {
+		tpuType  string
+		expected string
+	}{
+		{"v5litepod-1", "1x1"},
+		{"v5litepod-4", "2x2"},
+		{"v5litepod-8", "2x4"},
+		{"v5litepod-16", "4x4"},
+		{"v5litepod-32", "4x8"},
+		{"v5litepod-64", "8x8"},
+		{"v5litepod-128", "8x16"},
+		{"v5litepod-256", "16x16"},
+		{"invalid", "2x2"},
+	}
+
+	for _, tt := range topoTests {
+		got := GetTPUTopology(tt.tpuType)
+		if got != tt.expected {
+			t.Errorf("GetTPUTopology(%q) = %q, expected %q", tt.tpuType, got, tt.expected)
+		}
+	}
+}
+
+
 
 

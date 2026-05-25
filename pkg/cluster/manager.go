@@ -379,11 +379,11 @@ INSTANCE_NAME=$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.inte
 
 # Replace cloud-provider external flag with hostname-override and provider-id, and add node-labels
 sed -i "s/cloud-provider: \"external\"/hostname-override: \"${INSTANCE_NAME}\"\n    provider-id: \"tpu:\/\/${INSTANCE_NAME}\"/" /etc/kubernetes/kubeadm-config.yaml
-sed -i "/hostname-override: /a \\    node-labels: \"kingc.role\/tpu=true,node.kubernetes.io\/exclude-from-external-load-balancers=true,cloud.google.com\/gke-tpu-accelerator=%s\"" /etc/kubernetes/kubeadm-config.yaml
+sed -i "/hostname-override: /a \\    node-labels: \"kingc.role\/tpu=true,node.kubernetes.io\/exclude-from-external-load-balancers=true,cloud.google.com\/gke-tpu-accelerator=%s,cloud.google.com\/gke-accelerator-count=%s,cloud.google.com\/gke-tpu-topology=%s\"" /etc/kubernetes/kubeadm-config.yaml
 
 echo "👑 kingc: Joining cluster..."
 kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-errors=NumCPU
-`, baseInstallScript, kubeadmConfig, config.MapTPUAcceleratorLabel(tg.AcceleratorType))
+`, baseInstallScript, kubeadmConfig, config.MapTPUAcceleratorLabel(tg.AcceleratorType), config.GetTPUChipCount(tg.AcceleratorType), config.GetTPUTopology(tg.AcceleratorType))
 
 				tmpTPUStartup := filepath.Join(tmpDir, fmt.Sprintf("tpu-startup-%s.sh", tg.Name))
 				if err := os.WriteFile(tmpTPUStartup, []byte(tpuStartup), 0644); err != nil {

@@ -19,5 +19,4 @@ spec:
   - name: tpu-workers
     replicas: 1
     acceleratorType: v5litepod-8
-    zone: us-south1-a
-    spot: false
+    spot: true
