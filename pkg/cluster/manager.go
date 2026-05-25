@@ -132,7 +132,7 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 			for _, sub := range net.Subnets {
 				// Use subnet spec's Region since it defaults to cluster region
 				if !m.gce.SubnetExists(ctx, sub.Name, sub.Region) {
-					if err := m.gce.CreateSubnet(ctx, sub.Name, netName, sub.Region, sub.CIDR); err != nil {
+					if err := m.gce.CreateSubnet(ctx, sub.Name, netName, sub.Region, sub.CIDR, fmt.Sprintf("pods=%s", cfg.Spec.Kubernetes.Networking.PodCIDR)); err != nil {
 						return err
 					}
 				}
@@ -209,6 +209,7 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 
 	templateData := map[string]interface{}{
 		"ClusterName":              cfg.Metadata.Name,
+		"ProjectID":                projID,
 		"ControlPlaneEndpoint":     cfg.Spec.ExternalAPIServer.Host,
 		"ControlPlaneIP":           cfg.Spec.ExternalAPIServer.Hostname(),
 		"KubernetesVersion":        cfg.Spec.Kubernetes.Version,
@@ -303,7 +304,7 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 				cpName, cpZone, cfg.Spec.ControlPlane.MachineType,
 				cpNet, cpSub,
 				imageProject, imageName, "", tmpCPStartup,
-				cpIP, "",
+				cpIP, "", "pods:/24",
 				[]string{
 					basename(cfg.Metadata.Name),
 					"kingc-role-control-plane",
@@ -378,7 +379,7 @@ INSTANCE_NAME=$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.inte
 
 # Replace cloud-provider external flag with hostname-override and provider-id, and add node-labels
 sed -i "s/cloud-provider: \"external\"/hostname-override: \"${INSTANCE_NAME}\"\n    provider-id: \"tpu:\/\/${INSTANCE_NAME}\"/" /etc/kubernetes/kubeadm-config.yaml
-sed -i "/hostname-override: /a \\    node-labels: \"kingc.role\/tpu=true,cloud.google.com\/gke-tpu-accelerator=%s\"" /etc/kubernetes/kubeadm-config.yaml
+sed -i "/hostname-override: /a \\    node-labels: \"kingc.role\/tpu=true,node.kubernetes.io\/exclude-from-external-load-balancers=true,cloud.google.com\/gke-tpu-accelerator=%s\"" /etc/kubernetes/kubeadm-config.yaml
 
 echo "👑 kingc: Joining cluster..."
 kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-errors=NumCPU
@@ -407,7 +408,7 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 						klog.Infof("🔍 Attempting to secure TPU Spot capacity in %s...", sz)
 
 						tRegion := sz[:len(sz)-2]
-						if err := m.ensureSubnetwork(ctx, cpNet, cpSub, tRegion); err != nil {
+						if err := m.ensureSubnetwork(ctx, cpNet, cpSub, tRegion, cfg.Spec.Kubernetes.Networking.PodCIDR); err != nil {
 							klog.Warningf("      ⚠️  Failed to ensure subnet in region %s: %v", tRegion, err)
 							continue
 						}
@@ -466,7 +467,7 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 						rVersion = config.MapTPURuntimeVersion(tg.AcceleratorType)
 					}
 					tRegion := tZone[:len(tZone)-2]
-					if err := m.ensureSubnetwork(ctx, cpNet, cpSub, tRegion); err != nil {
+					if err := m.ensureSubnetwork(ctx, cpNet, cpSub, tRegion, cfg.Spec.Kubernetes.Networking.PodCIDR); err != nil {
 						errCh <- err
 						return
 					}
@@ -489,6 +490,18 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 						)
 						if err != nil {
 							errCh <- err
+							return
+						}
+
+						tpuIP, err := m.gce.GetTPUIP(ctx, tpuName, tZone)
+						if err != nil {
+							errCh <- fmt.Errorf("failed to resolve TPU host IP: %v", err)
+							return
+						}
+
+						klog.Infof("    - [TPU Alias] Dynamically allocating GCE IP Alias (pods:/24) on GCE TPU VM host %s (%s)...", tpuName, tpuIP)
+						if err := m.gce.SetTPUIPAlias(ctx, tZone, tpuIP, "/24"); err != nil {
+							errCh <- fmt.Errorf("failed to set GCE IP Alias for TPU VM: %v", err)
 							return
 						}
 					}
@@ -996,7 +1009,7 @@ func (m *Manager) findSupportedZones(ctx context.Context, accelType string) ([]s
 	return finalSupported, nil
 }
 
-func (m *Manager) ensureSubnetwork(ctx context.Context, network, subnetBase, region string) error {
+func (m *Manager) ensureSubnetwork(ctx context.Context, network, subnetBase, region, podCIDR string) error {
 	hash := 0
 	for _, char := range region {
 		hash += int(char)
@@ -1006,7 +1019,7 @@ func (m *Manager) ensureSubnetwork(ctx context.Context, network, subnetBase, reg
 
 	if !m.gce.SubnetExists(ctx, subnetBase, region) {
 		klog.Infof("🏗️  [Dynamic Subnet] Creating regional subnet %s (%s) on %s in region %s...", subnetBase, cidr, network, region)
-		return m.gce.CreateSubnet(ctx, subnetBase, network, region, cidr)
+		return m.gce.CreateSubnet(ctx, subnetBase, network, region, cidr, fmt.Sprintf("pods=%s", podCIDR))
 	}
 	return nil
 }

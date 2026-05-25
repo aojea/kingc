@@ -1,4 +1,15 @@
 apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloud-config
+  namespace: kube-system
+data:
+  gce.conf: |
+    [Global]
+    project-id = "{{ .ProjectID }}"
+    node-tags = "kingc-cluster-{{ .ClusterName }}"
+---
+apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: cloud-controller-manager
@@ -124,6 +135,17 @@ rules:
   - configmaps
   verbs:
   - get
+- apiGroups:
+  - ""
+  resources:
+  - services
+  - services/status
+  verbs:
+  - get
+  - list
+  - watch
+  - patch
+  - update
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -253,6 +275,9 @@ subjects:
 - kind: ServiceAccount
   name: cloud-controller-manager
   namespace: kube-system
+- kind: ServiceAccount
+  name: cloud-provider
+  namespace: kube-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -303,12 +328,22 @@ spec:
         command:
         - /cloud-controller-manager
         - --cloud-provider=gce
+        - --cloud-config=/etc/kubernetes/gce.conf
         - --leader-elect=true
         - --use-service-account-credentials
         - --configure-cloud-routes=false
         - --allocate-node-cidrs=true
+        - --cidr-allocator-type=CloudAllocator
         - --cluster-cidr={{ .PodSubnet }}
         - --v=2
+        volumeMounts:
+        - name: cloud-config
+          mountPath: /etc/kubernetes
+          readOnly: true
         resources:
           requests:
             cpu: "200m"
+      volumes:
+      - name: cloud-config
+        configMap:
+          name: cloud-config

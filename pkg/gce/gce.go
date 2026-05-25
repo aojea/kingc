@@ -225,11 +225,17 @@ func (c *Client) CreateNetwork(ctx context.Context, name string, autoMode bool, 
 	return err
 }
 
-func (c *Client) CreateSubnet(ctx context.Context, name, network, region, rangeCIDR string) error {
-	_, err := c.Run(ctx, "compute", "networks", "subnets", "create", name,
+func (c *Client) CreateSubnet(ctx context.Context, name, network, region, rangeCIDR string, secondaryRange string) error {
+	args := []string{
+		"compute", "networks", "subnets", "create", name,
 		"--network", network,
 		"--region", region,
-		"--range", rangeCIDR)
+		"--range", rangeCIDR,
+	}
+	if secondaryRange != "" {
+		args = append(args, "--secondary-range", secondaryRange)
+	}
+	_, err := c.Run(ctx, args...)
 	return err
 }
 
@@ -273,7 +279,7 @@ func (c *Client) DeleteStaticIP(ctx context.Context, name, region string) error 
 	return nil
 }
 
-func (c *Client) CreateInstance(ctx context.Context, name, zone, machineType, network, subnet, imageProject, image, serviceAccount, startupScript, address, privateIP string, tags []string) error {
+func (c *Client) CreateInstance(ctx context.Context, name, zone, machineType, network, subnet, imageProject, image, serviceAccount, startupScript, address, privateIP string, aliases string, tags []string) error {
 	args := []string{
 		"compute", "instances", "create", name,
 		"--zone", zone,
@@ -286,6 +292,9 @@ func (c *Client) CreateInstance(ctx context.Context, name, zone, machineType, ne
 		"--scopes", "cloud-platform",
 		"--tags", strings.Join(tags, ","),
 		"--metadata-from-file", fmt.Sprintf("startup-script=%s", startupScript),
+	}
+	if aliases != "" {
+		args = append(args, "--aliases", aliases)
 	}
 	if address != "" {
 		args = append(args, "--address", address)
@@ -442,6 +451,7 @@ func (c *Client) CreateInstanceTemplate(ctx context.Context, name, machineType s
 	for i := 0; i < len(networks); i++ {
 		nicArg := fmt.Sprintf("network=%s,subnet=%s", networks[i], subnets[i])
 		if i == 0 {
+			nicArg = nicArg + ",aliases=pods:/24"
 			args = append(args, "--network-interface", nicArg)
 		} else {
 			args = append(args, "--network-interface", nicArg+",no-address")
@@ -600,6 +610,33 @@ func (c *Client) TPUVMSSH(ctx context.Context, name, zone string, cmd []string) 
 		args = append(args, "--command", strings.Join(cmd, " "))
 	}
 	_, err := c.Run(ctx, args...)
+	return err
+}
+
+func (c *Client) GetTPUIP(ctx context.Context, name, zone string) (string, error) {
+	out, err := c.RunQuiet(ctx, "compute", "tpus", "tpu-vm", "describe", name, "--zone", zone, "--format=value(networkEndpoints[0].ipAddress)")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+func (c *Client) SetTPUIPAlias(ctx context.Context, zone, tpuIP, aliasRange string) error {
+	// Find GCE instance name by IP
+	out, err := c.RunQuiet(ctx, "compute", "instances", "list", fmt.Sprintf("--filter=networkInterfaces[0].networkIP=%s", tpuIP), fmt.Sprintf("--zones=%s", zone), "--format=value(name)")
+	if err != nil {
+		return fmt.Errorf("failed to find GCE instance name for IP %s: %v", tpuIP, err)
+	}
+	instName := strings.TrimSpace(out)
+	if instName == "" {
+		return fmt.Errorf("no GCE instance found with IP %s in zone %s", tpuIP, zone)
+	}
+
+	// Update interface to set aliases
+	_, err = c.Run(ctx, "compute", "instances", "network-interfaces", "update", instName,
+		"--zone", zone,
+		"--network-interface", "nic0",
+		"--aliases", fmt.Sprintf("pods:%s", aliasRange))
 	return err
 }
 
