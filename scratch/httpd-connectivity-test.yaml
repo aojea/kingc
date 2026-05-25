@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: httpd-connectivity-test
+  namespace: default
+  labels:
+    app: httpd-connectivity
+spec:
+  selector:
+    matchLabels:
+      app: httpd-connectivity
+  template:
+    metadata:
+      labels:
+        app: httpd-connectivity
+    spec:
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: httpd
+        image: docker.io/library/httpd:2
+        ports:
+        - containerPort: 80
+          name: http
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "32Mi"

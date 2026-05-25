@@ -15,3 +15,11 @@ func MapTPURuntimeVersion(tpuType string) string {
 		return "tpu-ubuntu2204-base" // v4 and older
 	}
 }
+
+// MapTPUAcceleratorLabel dynamically maps GCE TPU model names to GKE's standard accelerator label values.
+func MapTPUAcceleratorLabel(tpuType string) string {
+	if strings.HasPrefix(tpuType, "v5litepod-") {
+		return "tpu-v5-lite-podslice"
+	}
+	return tpuType
+}

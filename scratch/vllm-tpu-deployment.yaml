@@ -1,0 +1,76 @@
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  namespace: default
+  name: multi-tpu-claim
+spec:
+  spec:
+    devices:
+      requests:
+      - name: tpus
+        exactly:
+          deviceClassName: tpu.google.com
+          allocationMode: All
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-tpu-server
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-tpu
+  template:
+    metadata:
+      labels:
+        app: vllm-tpu
+    spec:
+      tolerations:
+      - key: "google.com/tpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+      containers:
+      - name: vllm-tpu
+        image: docker.io/vllm/vllm-tpu:2e33fe419186c65a18da6668972d61d7bbc31564
+        command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+        - --host=0.0.0.0
+        - --port=8000
+        - --max-model-len=8192
+        - --model=Qwen/Qwen2-1.5B
+        env:
+          - name: HUGGING_FACE_HUB_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: hf-token-secret
+                key: token
+        resources:
+          claims:
+          - name: tpus
+        volumeMounts:
+        - name: dshm
+          mountPath: /dev/shm
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+      resourceClaims:
+      - name: tpus
+        resourceClaimTemplateName: multi-tpu-claim
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service
+  namespace: default
+spec:
+  type: LoadBalancer
+  selector:
+    app: vllm-tpu
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8000
+      targetPort: 8000

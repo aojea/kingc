@@ -383,7 +383,7 @@ sed -i "/hostname-override: /a \\    node-labels: \"kingc.role\/tpu=true,node.ku
 
 echo "👑 kingc: Joining cluster..."
 kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-errors=NumCPU
-`, baseInstallScript, kubeadmConfig, tg.AcceleratorType)
+`, baseInstallScript, kubeadmConfig, config.MapTPUAcceleratorLabel(tg.AcceleratorType))
 
 				tmpTPUStartup := filepath.Join(tmpDir, fmt.Sprintf("tpu-startup-%s.sh", tg.Name))
 				if err := os.WriteFile(tmpTPUStartup, []byte(tpuStartup), 0644); err != nil {
