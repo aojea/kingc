@@ -225,7 +225,7 @@ spec:
           path: /proc
           type: Directory
       nodeSelector:
-        kingc.role/tpu: true
+        kingc.role/tpu: "true"
 ---
 # Source: dra-driver-google-tpu/templates/deviceclass.yaml
 apiVersion: resource.k8s.io/v1

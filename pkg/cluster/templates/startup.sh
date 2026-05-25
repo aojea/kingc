@@ -58,6 +58,12 @@ install_dependencies() {
     mkdir -p /etc/containerd
     containerd config default > /etc/containerd/config.toml
     sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+    
+    # Set LimitMEMLOCK=infinity for containerd
+    mkdir -p /etc/systemd/system/containerd.service.d
+    printf "[Service]\nLimitMEMLOCK=infinity\n" > /etc/systemd/system/containerd.service.d/limits.conf
+    
+    systemctl daemon-reload
     systemctl restart containerd
 
     # Install Kubeadm/Kubelet/Kubectl
