@@ -280,21 +280,22 @@ func (c *Client) DeleteStaticIP(ctx context.Context, name, region string) error 
 }
 
 func (c *Client) CreateInstance(ctx context.Context, name, zone, machineType, network, subnet, imageProject, image, serviceAccount, startupScript, address, privateIP string, aliases string, tags []string) error {
+	nicArg := fmt.Sprintf("network=%s,subnet=%s", network, subnet)
+	if aliases != "" {
+		nicArg = fmt.Sprintf("%s,aliases=%s", nicArg, aliases)
+	}
+
 	args := []string{
 		"compute", "instances", "create", name,
 		"--zone", zone,
 		"--machine-type", machineType,
-		"--network", network,
-		"--subnet", subnet,
+		"--network-interface", nicArg,
 		"--image", image,
 		"--image-project", imageProject,
 		"--boot-disk-size", "50GB",
 		"--scopes", "cloud-platform",
 		"--tags", strings.Join(tags, ","),
 		"--metadata-from-file", fmt.Sprintf("startup-script=%s", startupScript),
-	}
-	if aliases != "" {
-		args = append(args, "--aliases", aliases)
 	}
 	if address != "" {
 		args = append(args, "--address", address)
