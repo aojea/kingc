@@ -6,6 +6,16 @@ modprobe -v br_netfilter
 sysctl -w net.ipv4.ip_forward=1
 echo "net.ipv4.ip_forward=1" | tee -a /etc/sysctl.conf
 
+# Configure loose Reverse Path Filtering (GCE IP Alias requirement)
+sysctl -w net.ipv4.conf.all.rp_filter=2
+sysctl -w net.ipv4.conf.default.rp_filter=2
+echo "net.ipv4.conf.all.rp_filter=2" | tee -a /etc/sysctl.conf
+echo "net.ipv4.conf.default.rp_filter=2" | tee -a /etc/sysctl.conf
+
+# Accept packet forwarding for Pod network CIDR inside host iptables
+iptables -A FORWARD -s {{ .PodSubnet }} -j ACCEPT
+iptables -A FORWARD -d {{ .PodSubnet }} -j ACCEPT
+
 sysctl --system
 
 # Wrapper function to allow clean early-return without terminating the whole startup-script
@@ -16,6 +26,13 @@ install_dependencies() {
     fi
 
     echo "📦 kubeadm not found. Installing packages..."
+
+    # Force terminate and disable unattended-upgrades to release the dpkg frontend lock cleanly
+    echo "🛑 Terminating unattended-upgrades to release dpkg locks..."
+    systemctl stop unattended-upgrades || true
+    systemctl disable unattended-upgrades || true
+    killall -9 unattended-upgr || true
+    dpkg --configure -a || true
 
     # Robust apt-get wrapper that retries on lock acquisition failure or network issues
     apt_get_retry() {
