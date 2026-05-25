@@ -284,6 +284,9 @@ func (c *Client) CreateInstance(ctx context.Context, name, zone, machineType, ne
 	if aliases != "" {
 		nicArg = fmt.Sprintf("%s,aliases=%s", nicArg, aliases)
 	}
+	if address != "" {
+		nicArg = fmt.Sprintf("%s,address=%s", nicArg, address)
+	}
 
 	args := []string{
 		"compute", "instances", "create", name,
@@ -296,9 +299,6 @@ func (c *Client) CreateInstance(ctx context.Context, name, zone, machineType, ne
 		"--scopes", "cloud-platform",
 		"--tags", strings.Join(tags, ","),
 		"--metadata-from-file", fmt.Sprintf("startup-script=%s", startupScript),
-	}
-	if address != "" {
-		args = append(args, "--address", address)
 	}
 	if privateIP != "" {
 		args = append(args, "--private-network-ip", privateIP)
