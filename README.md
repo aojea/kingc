@@ -323,18 +323,86 @@ else
 fi
 ```
 
+> [!IMPORTANT]
+> **JAX / OpenXLA Graph Compilation Startup Delay**
+> When the `vllm-tpu-server` pod starts up, it dynamically pulls and compiles the PyTorch/JAX model weights specifically for the 8 TPU Tensor Cores. 
+> 
+> **This initial compilation process takes approximately 5 to 6 minutes.** 
+> During this time, calling the API will result in a `Connection refused` error. **This is normal and expected.** 
+> 
+> Please monitor the startup progress by watching the container logs:
+> ```bash
+> kubectl logs -f deployment/vllm-tpu-server -c vllm-tpu
+> ```
+> 
+> You will see the logs transition through the following stages:
+> 1. **Loading checkpoint shards**:
+>    ```
+>    Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:02<00:00,  2.85s/it]
+>    ```
+> 2. **Prefill XLA Graph Compilation (takes ~2.5 mins)**:
+>    ```
+>    INFO 05-25 20:00:47 tpu_model_runner.py:274] Compiling the model with different input shapes...
+>    ...
+>    INFO 05-25 20:03:18 tpu_model_runner.py:291] Compilation for prefill done in 150.36 s.
+>    ```
+> 3. **Decode Generative Step XLA Graph Compilation (takes ~2.5 mins)**:
+>    ```
+>    INFO 05-25 20:04:03 tpu_model_runner.py:327] batch_size: 8, seq_len: 1
+>    ...
+>    INFO 05-25 20:05:47 tpu_model_runner.py:334] Compilation for decode done in 149.08 s.
+>    ```
+> 4. **API Server Live**:
+>    ```
+>    INFO:     Started server process [1]
+>    INFO:     Waiting for application startup.
+>    INFO:     Application startup complete.
+>    INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+>    ```
+> Once the Uvicorn server is live, your API call will connect and return responses instantly!
 
-## FAQ
+#### Example Successful Models List Output:
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "Qwen/Qwen2-1.5B",
+      "object": "model",
+      "created": 1779739564,
+      "owned_by": "vllm",
+      "root": "Qwen/Qwen2-1.5B"
+    }
+  ]
+}
+```
 
-### Why not just use GKE?
+#### Example Successful Inference Output:
+```json
+{
+  "id": "chatcmpl-9efd533b77cd4e878044e277a945dc4a",
+  "object": "chat.completion",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "A Tensor-Processing-Unit (TPU) is a type of computer chip designed specifically for artificial intelligence (AI) tasks."
+      },
+      "finish_reason": "length"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 32,
+    "total_tokens": 82,
+    "completion_tokens": 50
+  }
+}
+```
 
-GKE is fantastic, but sometimes you need to test the control plane itself, have much more control over the cluster, or debug the Google Cloud Controller Manager. In those cases, `kingc` gives you more control over the cluster.
 
-### Why not use Kops?
 
-[Kops](https://kops.sigs.k8s.io/) is a powerful lifecycle management tool (upgrades, terraform integration, state storage). `kingc` is an ephemeral tool. It is designed to spin up a cluster in 3 minutes, run a test, and delete it or leverage other tools for lifecycle management.
-
-### Where is the CNI?
+# Where is the CNI?
 
 Like Kind, `kingc` installs [kindnet](https://github.com/kubernetes-sigs/kindnet) by default, but users can disable the default CNI and install their own.
 
