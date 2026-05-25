@@ -585,26 +585,26 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 		}
 	}
 
-	// Install Google Cloud TPU Device Plugin (if TPU groups are defined)
+	// Install Google Cloud TPU DRA Driver (if TPU groups are defined)
 	if len(cfg.Spec.TPUGroups) > 0 {
-		defer m.measure("Install TPU Device Plugin")()
-		klog.Infof("  > Installing Google Cloud TPU Device Plugin...")
+		defer m.measure("Install TPU DRA Driver")()
+		klog.Infof("  > Installing Google Cloud TPU DRA Driver...")
 		
-		tpuPluginManifest, err := m.renderTemplate("templates/tpu-device-plugin.yaml", templateData)
+		tpuDriverManifest, err := m.renderTemplate("templates/dra-tpu-driver.yaml", templateData)
 		if err != nil {
 			return err
 		}
 		
-		tmpTPUPlugin := filepath.Join(tmpDir, "tpu-device-plugin.yaml")
-		if err := os.WriteFile(tmpTPUPlugin, []byte(tpuPluginManifest), 0644); err != nil {
+		tmpTPUDriver := filepath.Join(tmpDir, "dra-tpu-driver.yaml")
+		if err := os.WriteFile(tmpTPUDriver, []byte(tpuDriverManifest), 0644); err != nil {
 			return err
 		}
 		
-		cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", localKubeconfig, "apply", "-f", tmpTPUPlugin)
+		cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", localKubeconfig, "apply", "-f", tmpTPUDriver)
 		if out, err := cmd.CombinedOutput(); err != nil {
-			klog.Warningf("    ⚠️  Failed to install GCP TPU Device Plugin: %v\nOutput: %s", err, out)
+			klog.Warningf("    ⚠️  Failed to install GCP TPU DRA Driver: %v\nOutput: %s", err, out)
 		} else {
-			klog.Infof("    ✅ Successfully applied Google Cloud TPU Device Plugin DaemonSet")
+			klog.Infof("    ✅ Successfully applied Google Cloud TPU DRA Driver")
 		}
 	}
 
