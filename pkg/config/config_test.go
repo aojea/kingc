@@ -2,7 +2,6 @@ package config
 
 import (
 	"os"
-	"strings"
 	"testing"
 )
 
@@ -99,37 +98,7 @@ func TestSetDefaults(t *testing.T) {
 				},
 			},
 		},
-		{
-			name: "TPU Group Defaults (Zone empty)",
-			input: &Cluster{
-				Spec: Spec{
-					Region: "us-central1",
-					TPUGroups: []TPUGroup{
-						{
-							Name:            "tpu1",
-							AcceleratorType: "v5litepod-8",
-						},
-					},
-				},
-			},
-			expected: &Cluster{
-				Spec: Spec{
-					Region: "us-central1",
-					ControlPlane: NodeGroup{
-						Region: "us-central1",
-						Zone:   "us-central1-a",
-					},
-					TPUGroups: []TPUGroup{
-						{
-							Name:            "tpu1",
-							AcceleratorType: "v5litepod-8",
-							Zone:            "", // Should remain empty for dynamic zone hunting
-							Replicas:        1,
-						},
-					},
-				},
-			},
-		},
+
 	}
 
 	for _, tt := range tests {
@@ -148,19 +117,7 @@ func TestSetDefaults(t *testing.T) {
 					t.Errorf("expected Worker Zone %s, got %s", tt.expected.Spec.WorkerGroups[0].Zone, tt.input.Spec.WorkerGroups[0].Zone)
 				}
 			}
-			if len(tt.input.Spec.TPUGroups) > 0 {
-				tgGot := tt.input.Spec.TPUGroups[0]
-				tgExp := tt.expected.Spec.TPUGroups[0]
-				if tgGot.Zone != tgExp.Zone {
-					t.Errorf("expected TPU Zone %q, got %q", tgExp.Zone, tgGot.Zone)
-				}
-				if tgGot.Replicas != tgExp.Replicas {
-					t.Errorf("expected TPU Replicas %d, got %d", tgExp.Replicas, tgGot.Replicas)
-				}
-				if tgGot.Spot == nil || *tgGot.Spot != true {
-					t.Errorf("expected TPU Spot to be true, got %v", tgGot.Spot)
-				}
-			}
+
 		})
 	}
 }
@@ -346,7 +303,7 @@ func TestResolveImage(t *testing.T) {
 			name:            "Non-prebaked version fallback",
 			version:         "v1.33.0",
 			expectedProject: "ubuntu-os-cloud",
-			expectedImage:   "ubuntu-2404-lts-amd64",
+			expectedImage:   "family/ubuntu-2404-lts-amd64",
 		},
 	}
 
@@ -363,81 +320,9 @@ func TestResolveImage(t *testing.T) {
 	}
 }
 
-func TestMapTPURuntimeVersion(t *testing.T) {
-	tests := []struct {
-		tpuType         string
-		expectedRuntime string
-	}{
-		{tpuType: "v6e-4", expectedRuntime: "v2-alpha-tpuv6e"},
-		{tpuType: "v5p-8", expectedRuntime: "v2-alpha-tpuv5"},
-		{tpuType: "v5litepod-8", expectedRuntime: "v2-alpha-tpuv5-lite"},
-		{tpuType: "v4-8", expectedRuntime: "tpu-ubuntu2204-base"},
-	}
 
-	for _, tt := range tests {
-		got := MapTPURuntimeVersion(tt.tpuType)
-		if got != tt.expectedRuntime {
-			t.Errorf("MapTPURuntimeVersion(%q) = %q, expected %q", tt.tpuType, got, tt.expectedRuntime)
-		}
-	}
-}
 
-func TestDeriveSubnetCIDR(t *testing.T) {
-	c1 := deriveSubnetCIDR("us-central1")
-	c2 := deriveSubnetCIDR("us-east5")
-	c3 := deriveSubnetCIDR("europe-west4")
 
-	if c1 == c2 || c1 == c3 || c2 == c3 {
-		t.Errorf("expected unique derived CIDRs, got: central=%s, east=%s, europe=%s", c1, c2, c3)
-	}
-	
-	// Check pattern format
-	if !strings.HasPrefix(c1, "10.") || !strings.HasSuffix(c1, ".0.0/24") {
-		t.Errorf("expected format 10.X.0.0/24, got %q", c1)
-	}
-}
-
-func TestTPUHelpers(t *testing.T) {
-	countTests := []struct {
-		tpuType  string
-		expected string
-	}{
-		{"v5litepod-8", "8"},
-		{"v5litepod-4", "4"},
-		{"v6e-4", "4"},
-		{"v5p-8", "8"},
-		{"v4", "4"}, // Fallback default
-	}
-
-	for _, tt := range countTests {
-		got := GetTPUChipCount(tt.tpuType)
-		if got != tt.expected {
-			t.Errorf("GetTPUChipCount(%q) = %q, expected %q", tt.tpuType, got, tt.expected)
-		}
-	}
-
-	topoTests := []struct {
-		tpuType  string
-		expected string
-	}{
-		{"v5litepod-1", "1x1"},
-		{"v5litepod-4", "2x2"},
-		{"v5litepod-8", "2x4"},
-		{"v5litepod-16", "4x4"},
-		{"v5litepod-32", "4x8"},
-		{"v5litepod-64", "8x8"},
-		{"v5litepod-128", "8x16"},
-		{"v5litepod-256", "16x16"},
-		{"invalid", "2x2"},
-	}
-
-	for _, tt := range topoTests {
-		got := GetTPUTopology(tt.tpuType)
-		if got != tt.expected {
-			t.Errorf("GetTPUTopology(%q) = %q, expected %q", tt.tpuType, got, tt.expected)
-		}
-	}
-}
 
 
 

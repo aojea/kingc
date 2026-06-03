@@ -24,5 +24,5 @@ func ResolveImage(version string) (string, string) {
 	}
 
 	// Fallback to original Ubuntu 24.04 LTS image
-	return "ubuntu-os-cloud", "ubuntu-2404-lts-amd64"
+	return "ubuntu-os-cloud", "family/ubuntu-2404-lts-amd64"
 }

@@ -95,6 +95,8 @@ It attempts to mimic the behavior and user experience of 'kind' but for GCE.`,
 		Short: "Run preflight checks to validate environment and GCP requirements",
 		Run:   runPreflight,
 	}
+
+
 )
 
 func init() {
@@ -143,6 +145,7 @@ func init() {
 	rootCmd.AddCommand(preflightCmd)
 	rootCmd.AddCommand(completionCmd)
 
+
 	// Create Cluster Flags
 	createClusterCmd.Flags().String("config", "", "Path to a kingc.yaml config file")
 	createClusterCmd.Flags().String("name", "kingc", "Cluster name")
@@ -159,6 +162,8 @@ func init() {
 
 	// Export Logs Flags
 	exportLogsCmd.Flags().String("name", "kingc", "Cluster name")
+
+
 }
 
 // VerbosityLevel is a custom flag type for validation
@@ -401,3 +406,4 @@ func runExportLogs(cmd *cobra.Command, args []string) {
 	}
 	fmt.Printf("✅ Logs exported to %s\n", outDir)
 }
+

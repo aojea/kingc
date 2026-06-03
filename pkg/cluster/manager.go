@@ -13,7 +13,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"text/template"
 	"time"
 
@@ -129,11 +128,64 @@ func (m *Manager) Create(ctx context.Context, cfg *config.Cluster, retain bool) 
 					return err
 				}
 			}
+			// Clean up any conflicting stale subnets in other regions under the same network!
+			klog.Infof("🔍 [Subnet Analyzer] Scanning VPC network %s for conflicting stale subnets...", netName)
+			subList, err := m.gce.ListSubnets(ctx, fmt.Sprintf("network:%s", netName))
+			if err == nil {
+				// Gather our target regions for this network
+				targetRegions := make(map[string]bool)
+				for _, sub := range net.Subnets {
+					targetRegions[sub.Region] = true
+				}
+
+				for _, ks := range subList {
+					if !targetRegions[ks.Region] {
+						klog.Infof("🧹 [Subnet Cleanup] Deleting conflicting stale subnet %s in region %s...", ks.Name, ks.Region)
+						if err := m.gce.DeleteSubnet(ctx, ks.Name, ks.Region); err != nil {
+							klog.Warningf("      ⚠️  Failed to delete stale subnet %s: %v", ks.Name, err)
+						}
+					}
+				}
+			}
 			for _, sub := range net.Subnets {
+				// Dynamically allocate a non-overlapping regional Pod CIDR block statefully from the GCE VPC
+				regionalPodCIDR, err := m.gce.AllocateRegionalPodCIDR(ctx, netName, sub.Name, sub.Region, cfg.Spec.Kubernetes.Networking.PodCIDR)
+				if err != nil {
+					return fmt.Errorf("failed to allocate regional Pod CIDR for region %s: %v", sub.Region, err)
+				}
+
 				// Use subnet spec's Region since it defaults to cluster region
 				if !m.gce.SubnetExists(ctx, sub.Name, sub.Region) {
-					if err := m.gce.CreateSubnet(ctx, sub.Name, netName, sub.Region, sub.CIDR, fmt.Sprintf("pods=%s", cfg.Spec.Kubernetes.Networking.PodCIDR)); err != nil {
+					klog.Infof("🏗️  [Network Setup] Creating subnet %s in region %s with range %s and secondary range pods=%s...", sub.Name, sub.Region, sub.CIDR, regionalPodCIDR)
+					if err := m.gce.CreateSubnet(ctx, sub.Name, netName, sub.Region, sub.CIDR, fmt.Sprintf("pods=%s", regionalPodCIDR)); err != nil {
 						return err
+					}
+				} else {
+					// Subnet exists, ensure the pods secondary range is present and matches expected regional CIDR!
+					kSub, err := m.gce.GetSubnet(ctx, sub.Name, sub.Region)
+					if err == nil && kSub != nil {
+						hasPods := false
+						correctCIDR := false
+						actualCIDR := ""
+						for _, r := range kSub.SecondaryIpRanges {
+							if r.RangeName == "pods" {
+								hasPods = true
+								actualCIDR = r.IpCidrRange
+								if r.IpCidrRange == regionalPodCIDR {
+									correctCIDR = true
+								}
+								break
+							}
+						}
+						if hasPods && !correctCIDR {
+							return fmt.Errorf("subnetwork '%s' in region '%s' has conflicting pods secondary range '%s' (expected derived regional range '%s'). Please delete this subnetwork or delete the cluster to let kingc recreate it with correct regionalized ranges and avoid global VPC conflicts", sub.Name, sub.Region, actualCIDR, regionalPodCIDR)
+						}
+						if !hasPods {
+							klog.Infof("🔧 [Network Update] Subnet %s exists but is missing 'pods' secondary range. Adding it with regional pods CIDR %s...", sub.Name, regionalPodCIDR)
+							if err := m.gce.UpdateSubnetAddSecondaryRange(ctx, sub.Name, sub.Region, "pods", regionalPodCIDR); err != nil {
+								return fmt.Errorf("failed to update subnet with secondary range: %v", err)
+							}
+						}
 					}
 				}
 			}
@@ -289,12 +341,11 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 	klog.Infof("ℹ️  Resolved GCE Image for Kubernetes %s: %s/%s", cfg.Spec.Kubernetes.Version, imageProject, imageName)
 
 	// 4. Provision Control Plane and Worker pools concurrently
-	// 4. Provision Control Plane, Workers and TPU groups concurrently
-	numParallel := 2 + len(cfg.Spec.TPUGroups)
+	numParallel := 2
 	errCh := make(chan error, numParallel)
 	{
-		defer m.measure("Control Plane, Workers and TPU Provisioning")()
-		klog.Infof("  > Provisioning Control Plane VM, Worker Groups and TPU Groups in parallel...")
+		defer m.measure("Control Plane and Workers Provisioning")()
+		klog.Infof("  > Provisioning Control Plane VM and Worker Groups in parallel...")
 
 		// Control Plane VM Provisioning
 		go func() {
@@ -357,158 +408,6 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 			}
 			errCh <- nil
 		}()
-
-		// TPU Groups Provisioning
-		for _, tgp := range cfg.Spec.TPUGroups {
-			go func(tg config.TPUGroup) {
-				klog.Infof("    - [Parallel TPUs] Provisioning TPU group %s (%d replicas, type %s)...", tg.Name, tg.Replicas, tg.AcceleratorType)
-
-				tpuStartup := fmt.Sprintf(`%s
-
-# ---------------------------------------------------------
-# TPU VM Bootstrap
-# ---------------------------------------------------------
-echo "👑 kingc: Writing kubeadm config..."
-mkdir -p /etc/kubernetes
-cat <<EOF > /etc/kubernetes/kubeadm-config.yaml
-%s
-EOF
-
-# Fetch GCE instance name dynamically from metadata
-INSTANCE_NAME=$(curl -s -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name)
-
-# Replace cloud-provider external flag with hostname-override and provider-id, and add node-labels
-sed -i "s/cloud-provider: \"external\"/hostname-override: \"${INSTANCE_NAME}\"\n    provider-id: \"tpu:\/\/${INSTANCE_NAME}\"/" /etc/kubernetes/kubeadm-config.yaml
-sed -i "/hostname-override: /a \\    node-labels: \"kingc.role\/tpu=true,node.kubernetes.io\/exclude-from-external-load-balancers=true,cloud.google.com\/gke-tpu-accelerator=%s,cloud.google.com\/gke-accelerator-count=%s,cloud.google.com\/gke-tpu-topology=%s\"" /etc/kubernetes/kubeadm-config.yaml
-
-echo "👑 kingc: Joining cluster..."
-kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-errors=NumCPU
-`, baseInstallScript, kubeadmConfig, config.MapTPUAcceleratorLabel(tg.AcceleratorType), config.GetTPUChipCount(tg.AcceleratorType), config.GetTPUTopology(tg.AcceleratorType))
-
-				tmpTPUStartup := filepath.Join(tmpDir, fmt.Sprintf("tpu-startup-%s.sh", tg.Name))
-				if err := os.WriteFile(tmpTPUStartup, []byte(tpuStartup), 0644); err != nil {
-					errCh <- fmt.Errorf("failed to write tpu startup script: %v", err)
-					return
-				}
-
-				tZone := tg.Zone
-				if tZone == "" {
-					klog.Infof("🔍 TPU group %s has no explicit zone. Dynamic zone capacity hunting enabled...", tg.Name)
-					supportedZones, err := m.findSupportedZones(ctx, tg.AcceleratorType)
-					if err != nil {
-						errCh <- fmt.Errorf("tpu zone hunting failed: %v", err)
-						return
-					}
-
-					success := false
-					for _, sz := range supportedZones {
-						if !strings.HasPrefix(sz, cfg.Spec.Region) {
-							continue
-						}
-						klog.Infof("🔍 Attempting to secure TPU Spot capacity in %s...", sz)
-
-						tRegion := sz[:len(sz)-2]
-						if err := m.ensureSubnetwork(ctx, cpNet, cpSub, tRegion, cfg.Spec.Kubernetes.Networking.PodCIDR); err != nil {
-							klog.Warningf("      ⚠️  Failed to ensure subnet in region %s: %v", tRegion, err)
-							continue
-						}
-						tpuNet := fmt.Sprintf("projects/%s/global/networks/%s", projID, cpNet)
-						tpuSubnet := fmt.Sprintf("projects/%s/regions/%s/subnetworks/%s", projID, tRegion, cpSub)
-
-						tpuName := fmt.Sprintf("%s-%s-1", cfg.Metadata.Name, tg.Name)
-						err = m.gce.CreateTPUVM(
-							ctx,
-							tpuName, sz,
-							tg.AcceleratorType, config.MapTPURuntimeVersion(tg.AcceleratorType),
-							tpuNet, tpuSubnet,
-							tg.Spot != nil && *tg.Spot, tmpTPUStartup,
-							[]string{
-								basename(cfg.Metadata.Name),
-								"kingc-role-worker",
-								"kingc-tpu-group-" + tg.Name,
-							},
-						)
-						if err == nil {
-							klog.Infof("✅ SUCCESS: Secured TPU Spot capacity in %s!", sz)
-							tZone = sz
-							success = true
-
-							for i := 2; i <= tg.Replicas; i++ {
-								repName := fmt.Sprintf("%s-%s-%d", cfg.Metadata.Name, tg.Name, i)
-								if err := m.gce.CreateTPUVM(
-									ctx,
-									repName, tZone,
-									tg.AcceleratorType, config.MapTPURuntimeVersion(tg.AcceleratorType),
-									tpuNet, tpuSubnet,
-									tg.Spot != nil && *tg.Spot, tmpTPUStartup,
-									[]string{
-										basename(cfg.Metadata.Name),
-										"kingc-role-worker",
-										"kingc-tpu-group-" + tg.Name,
-									},
-								); err != nil {
-									errCh <- fmt.Errorf("failed to create TPU replica VM %s in %s: %v", repName, tZone, err)
-									return
-								}
-							}
-							break
-						} else {
-							klog.Warningf("❌ FAIL: Could not secure TPU in %s: %v", sz, err)
-						}
-					}
-
-					if !success {
-						errCh <- fmt.Errorf("could not secure TPU spot capacity in any supported zones for %s", tg.AcceleratorType)
-						return
-					}
-				} else {
-					rVersion := tg.RuntimeVersion
-					if rVersion == "" {
-						rVersion = config.MapTPURuntimeVersion(tg.AcceleratorType)
-					}
-					tRegion := tZone[:len(tZone)-2]
-					if err := m.ensureSubnetwork(ctx, cpNet, cpSub, tRegion, cfg.Spec.Kubernetes.Networking.PodCIDR); err != nil {
-						errCh <- err
-						return
-					}
-					tpuNet := fmt.Sprintf("projects/%s/global/networks/%s", projID, cpNet)
-					tpuSubnet := fmt.Sprintf("projects/%s/regions/%s/subnetworks/%s", projID, tRegion, cpSub)
-
-					for i := 1; i <= tg.Replicas; i++ {
-						tpuName := fmt.Sprintf("%s-%s-%d", cfg.Metadata.Name, tg.Name, i)
-						err := m.gce.CreateTPUVM(
-							ctx,
-							tpuName, tZone,
-							tg.AcceleratorType, rVersion,
-							tpuNet, tpuSubnet,
-							tg.Spot != nil && *tg.Spot, tmpTPUStartup,
-							[]string{
-								basename(cfg.Metadata.Name),
-								"kingc-role-worker",
-								"kingc-tpu-group-" + tg.Name,
-							},
-						)
-						if err != nil {
-							errCh <- err
-							return
-						}
-
-						tpuIP, err := m.gce.GetTPUIP(ctx, tpuName, tZone)
-						if err != nil {
-							errCh <- fmt.Errorf("failed to resolve TPU host IP: %v", err)
-							return
-						}
-
-						klog.Infof("    - [TPU Alias] Dynamically allocating GCE IP Alias (pods:/24) on GCE TPU VM host %s (%s)...", tpuName, tpuIP)
-						if err := m.gce.SetTPUIPAlias(ctx, tZone, tpuIP, "/24"); err != nil {
-							errCh <- fmt.Errorf("failed to set GCE IP Alias for TPU VM: %v", err)
-							return
-						}
-					}
-				}
-				errCh <- nil
-			}(tgp)
-		}
 
 		// Await concurrency completion
 		for i := 0; i < numParallel; i++ {
@@ -598,28 +497,7 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 		}
 	}
 
-	// Install Google Cloud TPU DRA Driver (if TPU groups are defined)
-	if len(cfg.Spec.TPUGroups) > 0 {
-		defer m.measure("Install TPU DRA Driver")()
-		klog.Infof("  > Installing Google Cloud TPU DRA Driver...")
-		
-		tpuDriverManifest, err := m.renderTemplate("templates/dra-tpu-driver.yaml", templateData)
-		if err != nil {
-			return err
-		}
-		
-		tmpTPUDriver := filepath.Join(tmpDir, "dra-tpu-driver.yaml")
-		if err := os.WriteFile(tmpTPUDriver, []byte(tpuDriverManifest), 0644); err != nil {
-			return err
-		}
-		
-		cmd := exec.CommandContext(ctx, "kubectl", "--kubeconfig", localKubeconfig, "apply", "-f", tmpTPUDriver)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			klog.Warningf("    ⚠️  Failed to install GCP TPU DRA Driver: %v\nOutput: %s", err, out)
-		} else {
-			klog.Infof("    ✅ Successfully applied Google Cloud TPU DRA Driver")
-		}
-	}
+
 
 	// Finalize (Merge Kubeconfig)
 	kcBytes, err := os.ReadFile(localKubeconfig)
@@ -637,6 +515,8 @@ kubeadm join --config /etc/kubernetes/kubeadm-config.yaml --ignore-preflight-err
 
 	return nil
 }
+
+
 
 func (m *Manager) Delete(ctx context.Context, name string) error {
 	defer m.measure("Delete Cluster " + name)()
@@ -724,49 +604,7 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 	}()
 
 
-	// Delete TPU VMs
-	func() {
-		defer m.measure("TPU VMs Cleanup")()
-		klog.Infof("  > Cleaning up TPU VMs...")
-		locations, err := m.gce.ListTPULocations(ctx)
-		if err != nil {
-			klog.Warningf("    ⚠️  Failed to list TPU locations: %v", err)
-			return
-		}
 
-		var wg sync.WaitGroup
-		var mu sync.Mutex
-		type tpuInfo struct{ Name, Zone string }
-		var tpusToDelete []tpuInfo
-
-		for _, loc := range locations {
-			wg.Add(1)
-			go func(zone string) {
-				defer wg.Done()
-				out, err := m.gce.RunQuiet(ctx, "compute", "tpus", "tpu-vm", "list", "--zone", zone, "--format=value(name)")
-				if err == nil && strings.TrimSpace(out) != "" {
-					mu.Lock()
-					for _, tName := range strings.Fields(out) {
-						if strings.HasPrefix(tName, name) {
-							tpusToDelete = append(tpusToDelete, tpuInfo{tName, zone})
-						}
-					}
-					mu.Unlock()
-				}
-			}(loc)
-		}
-		wg.Wait()
-
-		for _, t := range tpusToDelete {
-			klog.Infof("  > Deleting TPU VM %s in %s...", t.Name, t.Zone)
-			if err := m.gce.DeleteTPUVM(ctx, t.Name, t.Zone); err != nil && !gce.IsNotFoundError(err) {
-				klog.Warningf("    ⚠️  Failed: %v", err)
-				errs = append(errs, fmt.Errorf("delete TPU VM %s: %w", t.Name, err))
-			} else {
-				klog.Infof("    ✅ Done")
-			}
-		}
-	}()
 
 
 	// Delete Firewall Rules
@@ -808,6 +646,9 @@ func (m *Manager) Delete(ctx context.Context, name string) error {
 			}
 		}
 	}()
+
+
+
 
 
 	if len(errs) > 0 {
@@ -961,65 +802,5 @@ func (m *Manager) waitForAPIServer(ctx context.Context, uri *url.URL, timeout ti
 	}
 }
 
-func (m *Manager) findSupportedZones(ctx context.Context, accelType string) ([]string, error) {
-	locations, err := m.gce.ListTPULocations(ctx)
-	if err != nil {
-		return nil, err
-	}
 
-	var usZones, euroZones, otherZones []string
-	for _, loc := range locations {
-		if strings.HasPrefix(loc, "us-") {
-			usZones = append(usZones, loc)
-		} else if strings.HasPrefix(loc, "europe-") {
-			euroZones = append(euroZones, loc)
-		} else {
-			otherZones = append(otherZones, loc)
-		}
-	}
-	orderedZones := append(usZones, append(euroZones, otherZones...)...)
 
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var supportedZones []string
-
-	for _, zone := range orderedZones {
-		wg.Add(1)
-		go func(z string) {
-			defer wg.Done()
-			if m.gce.DescribeAcceleratorType(ctx, accelType, z) {
-				mu.Lock()
-				supportedZones = append(supportedZones, z)
-				mu.Unlock()
-			}
-		}(zone)
-	}
-	wg.Wait()
-
-	var finalSupported []string
-	for _, z := range orderedZones {
-		for _, sz := range supportedZones {
-			if sz == z {
-				finalSupported = append(finalSupported, sz)
-				break
-			}
-		}
-	}
-
-	return finalSupported, nil
-}
-
-func (m *Manager) ensureSubnetwork(ctx context.Context, network, subnetBase, region, podCIDR string) error {
-	hash := 0
-	for _, char := range region {
-		hash += int(char)
-	}
-	secondOctet := (hash % 250) + 1
-	cidr := fmt.Sprintf("10.%d.0.0/24", secondOctet)
-
-	if !m.gce.SubnetExists(ctx, subnetBase, region) {
-		klog.Infof("🏗️  [Dynamic Subnet] Creating regional subnet %s (%s) on %s in region %s...", subnetBase, cidr, network, region)
-		return m.gce.CreateSubnet(ctx, subnetBase, network, region, cidr, fmt.Sprintf("pods=%s", podCIDR))
-	}
-	return nil
-}

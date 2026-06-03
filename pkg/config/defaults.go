@@ -73,11 +73,6 @@ func (c *Cluster) SetDefaults() {
 		c.applyNodeGroupDefaults(&c.Spec.WorkerGroups[i], false)
 	}
 
-	// TPU Groups Defaults
-	for i := range c.Spec.TPUGroups {
-		c.applyTPUGroupDefaults(&c.Spec.TPUGroups[i])
-	}
-
 	// Kubernetes Defaults
 	if c.Spec.Kubernetes.Networking.PodCIDR == "" {
 		c.Spec.Kubernetes.Networking.PodCIDR = DefaultPodCIDR
@@ -116,16 +111,6 @@ func (c *Cluster) applyNodeGroupDefaults(ng *NodeGroup, isControlPlane bool) {
 	}
 	if ng.Replicas == 0 {
 		ng.Replicas = 1
-	}
-}
-
-func (c *Cluster) applyTPUGroupDefaults(tg *TPUGroup) {
-	if tg.Replicas == 0 {
-		tg.Replicas = 1
-	}
-	if tg.Spot == nil {
-		trueVal := true
-		tg.Spot = &trueVal
 	}
 }
 

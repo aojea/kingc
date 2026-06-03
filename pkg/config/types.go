@@ -34,7 +34,6 @@ type Spec struct {
 
 	ControlPlane NodeGroup   `yaml:"controlPlane"`
 	WorkerGroups []NodeGroup `yaml:"workerGroups"`
-	TPUGroups    []TPUGroup  `yaml:"tpuGroups"`
 
 	KubeadmConfigPatches []string `yaml:"kubeadmConfigPatches"`
 
@@ -151,12 +150,4 @@ func Load(path string) (*Cluster, error) {
 	return c, nil
 }
 
-type TPUGroup struct {
-	Name            string `yaml:"name"`
-	Zone            string `yaml:"zone"`
-	Replicas        int    `yaml:"replicas"`
-	AcceleratorType string `yaml:"acceleratorType"`
-	RuntimeVersion  string `yaml:"runtimeVersion"`
-	Spot            *bool  `yaml:"spot"`
-}
 

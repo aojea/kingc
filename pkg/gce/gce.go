@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -560,85 +561,136 @@ func (c *Client) ImageExists(ctx context.Context, project, name string) bool {
 	return err == nil
 }
 
-func (c *Client) CreateTPUVM(ctx context.Context, name, zone, accelType, runtimeVer string, network, subnetwork string, spot bool, startupScript string, tags []string) error {
-	args := []string{
-		"compute", "tpus", "tpu-vm", "create", name,
-		"--zone", zone,
-		"--accelerator-type", accelType,
-		"--version", runtimeVer,
-	}
-	if network != "" {
-		args = append(args, "--network", network)
-	}
-	if subnetwork != "" {
-		args = append(args, "--subnetwork", subnetwork)
-	}
-	if spot {
-		args = append(args, "--spot")
-	}
-	if len(tags) > 0 {
-		args = append(args, "--tags", strings.Join(tags, ","))
-	}
-	if startupScript != "" {
-		args = append(args, "--metadata-from-file", fmt.Sprintf("startup-script=%s", startupScript))
-	}
 
+
+func (c *Client) WaitUntilMIGStable(ctx context.Context, name, zone string, timeoutSec int) error {
+	args := []string{
+		"compute", "instance-groups", "managed", "wait-until", name,
+		"--stable",
+		"--zone", zone,
+		"--timeout", fmt.Sprintf("%d", timeoutSec),
+	}
 	_, err := c.Run(ctx, args...)
 	return err
 }
 
-func (c *Client) DeleteTPUVM(ctx context.Context, name, zone string) error {
-	_, err := c.Run(ctx, "compute", "tpus", "tpu-vm", "delete", name, "--zone", zone, "--quiet")
-	return err
+type SubnetDescribe struct {
+	SecondaryIpRanges []struct {
+		RangeName   string `json:"rangeName"`
+		IpCidrRange string `json:"ipCidrRange"`
+	} `json:"secondaryIpRanges"`
 }
 
-func (c *Client) ListTPULocations(ctx context.Context) ([]string, error) {
-	out, err := c.RunQuiet(ctx, "compute", "tpus", "locations", "list", "--format=value(locationId)")
+func (c *Client) GetSubnet(ctx context.Context, name, region string) (*SubnetDescribe, error) {
+	var sub SubnetDescribe
+	err := c.RunJSON(ctx, &sub, "compute", "networks", "subnets", "describe", name, "--region", region)
 	if err != nil {
 		return nil, err
 	}
-	return strings.Fields(out), nil
+	return &sub, nil
 }
 
-func (c *Client) DescribeAcceleratorType(ctx context.Context, accelType, zone string) bool {
-	_, err := c.RunQuiet(ctx, "compute", "tpus", "accelerator-types", "describe", accelType, "--zone", zone)
-	return err == nil
-}
-
-func (c *Client) TPUVMSSH(ctx context.Context, name, zone string, cmd []string) error {
-	args := []string{"compute", "tpus", "tpu-vm", "ssh", name, "--zone", zone}
-	if len(cmd) > 0 {
-		args = append(args, "--command", strings.Join(cmd, " "))
+func (c *Client) UpdateSubnetAddSecondaryRange(ctx context.Context, name, region, rangeName, cidr string) error {
+	args := []string{
+		"compute", "networks", "subnets", "update", name,
+		"--region", region,
+		"--add-secondary-ranges", fmt.Sprintf("%s=%s", rangeName, cidr),
 	}
 	_, err := c.Run(ctx, args...)
 	return err
 }
 
-func (c *Client) GetTPUIP(ctx context.Context, name, zone string) (string, error) {
-	out, err := c.RunQuiet(ctx, "compute", "tpus", "tpu-vm", "describe", name, "--zone", zone, "--format=value(networkEndpoints[0].ipAddress)")
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(out), nil
+type SubnetInfo struct {
+	Name   string `json:"name"`
+	Region string `json:"region"`
 }
 
-func (c *Client) SetTPUIPAlias(ctx context.Context, zone, tpuIP, aliasRange string) error {
-	// Find GCE instance name by IP
-	out, err := c.RunQuiet(ctx, "compute", "instances", "list", fmt.Sprintf("--filter=networkInterfaces[0].networkIP=%s", tpuIP), fmt.Sprintf("--zones=%s", zone), "--format=value(name)")
+func (c *Client) ListSubnets(ctx context.Context, filter string) ([]SubnetInfo, error) {
+	var subnets []SubnetInfo
+	err := c.RunJSON(ctx, &subnets, "compute", "networks", "subnets", "list", "--filter", filter)
 	if err != nil {
-		return fmt.Errorf("failed to find GCE instance name for IP %s: %v", tpuIP, err)
+		return nil, err
 	}
-	instName := strings.TrimSpace(out)
-	if instName == "" {
-		return fmt.Errorf("no GCE instance found with IP %s in zone %s", tpuIP, zone)
+	for i := range subnets {
+		if subnets[i].Region != "" {
+			parts := strings.Split(subnets[i].Region, "/")
+			subnets[i].Region = parts[len(parts)-1]
+		}
+	}
+	return subnets, nil
+}
+
+func (c *Client) DeleteSubnet(ctx context.Context, name, region string) error {
+	args := []string{
+		"compute", "networks", "subnets", "delete", name,
+		"--region", region,
+		"--quiet",
+	}
+	_, err := c.Run(ctx, args...)
+	if err != nil && !IsNotFoundError(err) {
+		return err
+	}
+	return nil
+}
+
+func (c *Client) AllocateRegionalPodCIDR(ctx context.Context, network, subnetName, region, baseCIDR string) (string, error) {
+	// 1. If the subnetwork already exists in GCE, check if it has a 'pods' range and reuse it!
+	if c.SubnetExists(ctx, subnetName, region) {
+		kSub, err := c.GetSubnet(ctx, subnetName, region)
+		if err == nil && kSub != nil {
+			for _, r := range kSub.SecondaryIpRanges {
+				if r.RangeName == "pods" {
+					return r.IpCidrRange, nil
+				}
+			}
+		}
 	}
 
-	// Update interface to set aliases
-	_, err = c.Run(ctx, "compute", "instances", "network-interfaces", "update", instName,
-		"--zone", zone,
-		"--network-interface", "nic0",
-		"--aliases", fmt.Sprintf("pods:%s", aliasRange))
-	return err
+	// 2. Parse base CIDR
+	ip, ipNet, err := net.ParseCIDR(baseCIDR)
+	if err != nil {
+		return baseCIDR, nil // fallback
+	}
+	ones, _ := ipNet.Mask.Size()
+	if ones > 16 {
+		return baseCIDR, nil // Cannot subdivide smaller than /16
+	}
+
+	// 3. Query GCE for all subnets on this network
+	subList, err := c.ListSubnets(ctx, fmt.Sprintf("network:%s", network))
+	if err != nil {
+		return baseCIDR, nil // fallback on list error
+	}
+
+	// 4. Parse secondary IP ranges for all subnets to collect used ranges
+	usedCIDRs := make(map[string]bool)
+	for _, s := range subList {
+		kSub, err := c.GetSubnet(ctx, s.Name, s.Region)
+		if err == nil && kSub != nil {
+			for _, r := range kSub.SecondaryIpRanges {
+				if r.RangeName == "pods" {
+					usedCIDRs[r.IpCidrRange] = true
+				}
+			}
+		}
+	}
+
+	// 5. Generate all 16 possible /20 blocks of the base /16 pod CIDR and pick the first unused
+	ipv4 := ip.To4()
+	if ipv4 == nil {
+		return baseCIDR, nil
+	}
+
+	for index := 0; index < 16; index++ {
+		thirdOctet := index * 16
+		candidateCIDR := fmt.Sprintf("%d.%d.%d.0/20", ipv4[0], ipv4[1], thirdOctet)
+		if !usedCIDRs[candidateCIDR] {
+			return candidateCIDR, nil
+		}
+	}
+
+	return baseCIDR, fmt.Errorf("VPC network %s has exhausted all 16 available /20 regional pod CIDR blocks in %s", network, baseCIDR)
 }
+
 
 
